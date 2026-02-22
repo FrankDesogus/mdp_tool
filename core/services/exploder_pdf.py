@@ -171,7 +171,9 @@ class ExplosionEdge:
     depth: int
     path: Tuple[str, ...]  # sequenza di code attraversate (pn)
     parent_bom_path: str = ""
-    description: str = ""   # ✅ aggiungi
+    description: str = ""
+    manufacturer: str = ""
+    manufacturer_code: str = ""
 
 
 @dataclass(frozen=True)
@@ -772,6 +774,8 @@ def explode_boms_pdf(
                         path=new_path,
                         parent_bom_path=str(getattr(parent_bom, "path", "")),
                         description=(getattr(line, "description", "") or "").strip(),
+                        manufacturer=(getattr(line, "manufacturer", "") or "").strip(),
+                        manufacturer_code=(getattr(line, "manufacturer_code", "") or "").strip(),
                     )
                 )
 
@@ -825,6 +829,9 @@ def explode_boms_pdf(
                     path=new_path,
                     parent_bom_path=str(getattr(parent_bom, "path", "")),
                     description=(getattr(line, "description", "") or "").strip(),
+                    manufacturer=(getattr(line, "manufacturer", "") or "").strip(),
+                    manufacturer_code=(getattr(line, "manufacturer_code", "") or "").strip(),
+
                 )
             )
 

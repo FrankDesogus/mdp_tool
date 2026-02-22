@@ -345,13 +345,25 @@ def _write_bom_explosion_tree_txt(explosion: object, out_path: Path) -> int:
     for e in getattr(explosion, "edges", []) or []:
         depth = int(getattr(e, "depth", 1) or 1)
         indent = "  " * max(0, depth - 1)
-        description = getattr(e, "description", "")
+        description = (getattr(e, "description", "") or "").strip()
+        manufacturer = (getattr(e, "manufacturer", "") or "").strip()
+        manufacturer_code = (getattr(e, "manufacturer_code", "") or "").strip()
+
 
         parent = f"{getattr(e, 'parent_code', '')} REV {getattr(e, 'parent_rev', '')}"
         child = f"{getattr(e, 'child_code', '')} REV {getattr(e, 'child_rev', '') or '-'}"
         qty = _fmt_qty(getattr(e, "qty", ""))
 
-        lines.append(f"{indent}- {child} -{description} x{qty}   (parent: {parent})")
+        meta_parts = []
+        if description:
+            meta_parts.append(f"desc={description}")
+        if manufacturer:
+            meta_parts.append(f"mfr={manufacturer}")
+        if manufacturer_code:
+            meta_parts.append(f"mfr_code={manufacturer_code}")
+        meta = f" [{' | '.join(meta_parts)}]" if meta_parts else ""
+
+        lines.append(f"{indent}- {child} x{qty}{meta}   (parent: {parent})")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

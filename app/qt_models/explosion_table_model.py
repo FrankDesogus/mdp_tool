@@ -62,15 +62,18 @@ class ExplosionTableModel(QAbstractTableModel):
 
         info = self._ctx.part_master.get(child_code)
         uom = self._ctx.uom_by_code.get(child_code, "")
+        manufacturer = (getattr(e, "manufacturer", "") or "").strip()
+        manufacturer_code = (getattr(e, "manufacturer_code", "") or "").strip()
+        description = (getattr(e, "description", "") or "").strip()
 
         vals = [
             child_code,
             child_rev,
             "" if qty is None else str(qty),
             uom,
-            "" if info is None else info.manufacturer,
-            "" if info is None else info.manufacturer_code,
-            "" if info is None else info.description,
+            ("" if info is None else info.manufacturer) or manufacturer,
+            ("" if info is None else info.manufacturer_code) or manufacturer_code,
+            ("" if info is None else info.description) or description,
             parent_code,
             "" if depth is None else str(depth),
         ]

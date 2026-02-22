@@ -7,6 +7,7 @@ from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 
 from core.domain.models import NormalizedBomLine, BomDocument
+from core.services.pn_canonical import canonicalize_pn, canonicalize_rev
 
 # Import "best effort" per typing: non devono rompere se i moduli non sono disponibili.
 try:
@@ -40,6 +41,34 @@ def _build_part_master(boms: List[BomDocument]) -> Dict[str, PartInfo]:
     Se più BOM danno info diverse, prendiamo la prima non-vuota incontrata.
     """
     out: Dict[str, PartInfo] = {}
+    def _candidate_keys(code: str, rev: str = "") -> List[str]:
+        keys: List[str] = []
+        raw = (code or "").strip()
+        if raw:
+            keys.append(raw)
+
+        canon = canonicalize_pn(raw, rev=canonicalize_rev(rev or "") or None)
+        if canon and canon not in keys:
+            keys.append(canon)
+        return keys
+
+    def _merge(code_key: str, desc: str, mfr: str, mfr_code: str) -> None:
+        prev = out.get(code_key)
+        if prev is None:
+            out[code_key] = PartInfo(
+                code=code_key,
+                description=desc,
+                manufacturer=mfr,
+                manufacturer_code=mfr_code,
+            )
+            return
+        out[code_key] = PartInfo(
+            code=code_key,
+            description=prev.description or desc,
+            manufacturer=prev.manufacturer or mfr,
+            manufacturer_code=prev.manufacturer_code or mfr_code,
+        )
+
 
     for b in boms:
         for ln in getattr(b, "lines", []) or []:
@@ -53,18 +82,12 @@ def _build_part_master(boms: List[BomDocument]) -> Dict[str, PartInfo]:
             desc = (getattr(ln, "description", "") or "").strip()
             mfr = (getattr(ln, "manufacturer", "") or "").strip()
             mfr_code = (getattr(ln, "manufacturer_code", "") or "").strip()
+            rev = (getattr(ln, "rev", "") or "").strip()
 
-            prev = out.get(code)
-            if prev is None:
-                out[code] = PartInfo(code=code, description=desc, manufacturer=mfr, manufacturer_code=mfr_code)
-            else:
-                # riempiamo solo i campi vuoti
-                out[code] = PartInfo(
-                    code=code,
-                    description=prev.description or desc,
-                    manufacturer=prev.manufacturer or mfr,
-                    manufacturer_code=prev.manufacturer_code or mfr_code,
-                )
+            for code_key in _candidate_keys(code, rev):
+                _merge(code_key, desc, mfr, mfr_code)
+
+
 
     return out
 
