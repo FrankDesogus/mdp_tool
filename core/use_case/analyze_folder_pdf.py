@@ -7,8 +7,6 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
-from scripts.regsetup import description
-
 # ✅ PDF-only discovery
 from core.parsers.discovery_pdf import DiscoveryPdfResult, discover_folder_pdf
 from core.parsers.bom_pdf import parse_bom_pdf_raw
