@@ -60,6 +60,8 @@ from core.services.totalization_compare import (
     summarize_totalization_validation,
 )
 
+from core.services.part_master import build_part_master, lookup_part_info
+
 # -------------------------
 # Report strutturati
 # -------------------------
@@ -159,6 +161,8 @@ def _write_pbs_tree_txt(pbs: Optional[PbsDocument], out_path: Path) -> int:
     rows = list(pbs.rows)
     min_level = min(int(getattr(x, "level", 0) or 0) for x in rows) if rows else 0
 
+    part_master = build_part_master(boms or [])
+
     lines: List[str] = []
     for r in rows:
         level = int(getattr(r, "level", 0) or 0)
@@ -174,15 +178,17 @@ def _write_pbs_tree_txt(pbs: Optional[PbsDocument], out_path: Path) -> int:
     return len(lines)
 
 
-def _write_bom_explosion_tree_txt(explosion: object, out_path: Path) -> int:
+def _write_bom_explosion_tree_txt(explosion: object, out_path: Path, boms: Optional[list[object]] = None) -> int:
     """
     Stampa l'albero di esplosione BOM usando ExplosionEdge.depth come indent.
-    Non dipende dal PBS.
+    Metadata (desc/mfr/mfr_code) coerenti con la GUI via part_master canonicalizzato.
     """
     if not explosion or not getattr(explosion, "edges", None):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text("(Explode vuoto)\n", encoding="utf-8")
         return 0
+
+    part_master = build_part_master(boms or [])
 
     lines: List[str] = []
     root = f"{getattr(explosion, 'root_code', '')} REV {getattr(explosion, 'root_rev', '')}"
@@ -194,10 +200,26 @@ def _write_bom_explosion_tree_txt(explosion: object, out_path: Path) -> int:
         indent = "  " * max(0, depth - 1)
 
         parent = f"{getattr(e, 'parent_code', '')} REV {getattr(e, 'parent_rev', '')}"
-        child = f"{getattr(e, 'child_code', '')} REV {getattr(e, 'child_rev', '') or '-'}"
+        child_code = (getattr(e, "child_code", "") or "").strip()
+        child_rev = (getattr(e, "child_rev", "") or "").strip()
+        child = f"{child_code} REV {child_rev or '-'}"
         qty = _fmt_qty(getattr(e, "qty", ""))
 
-        lines.append(f"{indent}- {child}  x{qty}   (parent: {parent})")
+        info = lookup_part_info(part_master, child_code, child_rev)
+        desc = (("" if info is None else info.description) or (getattr(e, "description", "") or "")).strip()
+        mfr = (("" if info is None else info.manufacturer) or (getattr(e, "manufacturer", "") or "")).strip()
+        mfr_code = (("" if info is None else info.manufacturer_code) or (getattr(e, "manufacturer_code", "") or "")).strip()
+
+        meta_parts = []
+        if desc:
+            meta_parts.append(f"desc={desc}")
+        if mfr:
+            meta_parts.append(f"mfr={mfr}")
+        if mfr_code:
+            meta_parts.append(f"mfr_code={mfr_code}")
+        meta = f" [{' | '.join(meta_parts)}]" if meta_parts else ""
+
+        lines.append(f"{indent}- {child}  x{qty}{meta}   (parent: {parent})")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1185,7 +1207,7 @@ class AnalyzeFolderUseCase:
                 flat_csv = diag_dir / "bom_flat_qty.csv"
 
                 n_pbs = _write_pbs_tree_txt(result.pbs, pbs_txt)
-                n_bom = _write_bom_explosion_tree_txt(result.explosion, bom_txt)
+                n_bom = _write_bom_explosion_tree_txt(result.explosion, bom_txt, boms=list(getattr(result, "boms", []) or []))
                 n_flat = _write_bom_flat_qty_csv(result.explosion, flat_csv)
 
                 result.issues.append(Issue("INFO", f"[EXPORT_TREE] PBS tree TXT creato: {pbs_txt.name} (righe={n_pbs})", pbs_txt, code="EXPORT_PBS_TREE"))

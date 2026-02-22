@@ -44,7 +44,7 @@ class TotalsTableModel(QAbstractTableModel):
             return None
 
         code, qty = self._rows[index.row()]
-        info = self._ctx.part_master.get(code)
+        info = self._ctx.part_info_for(code)
         uom = self._ctx.uom_by_code.get(code, "")
 
         vals = [

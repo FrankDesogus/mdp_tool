@@ -60,7 +60,7 @@ class ExplosionTableModel(QAbstractTableModel):
         parent_code = getattr(e, "parent_code", "") or ""
         depth = getattr(e, "depth", None)
 
-        info = self._ctx.part_master.get(child_code)
+        info = self._ctx.part_info_for(child_code, child_rev)
         uom = self._ctx.uom_by_code.get(child_code, "")
         manufacturer = (getattr(e, "manufacturer", "") or "").strip()
         manufacturer_code = (getattr(e, "manufacturer_code", "") or "").strip()

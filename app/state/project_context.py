@@ -3,12 +3,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import logging
+import os
 from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 
-from core.domain.models import NormalizedBomLine, BomDocument
-from core.services.pn_canonical import canonicalize_pn, canonicalize_rev
-
+from core.services.part_master import PartInfo, build_part_master, lookup_part_info, missing_lookup_samples
 # Import "best effort" per typing: non devono rompere se i moduli non sono disponibili.
 try:
     from core.domain.models import PbsDocument, MdpRow  # type: ignore
@@ -27,69 +27,8 @@ except Exception:  # pragma: no cover
     AnalyzeFolderResult = Any  # type: ignore
 
 
-@dataclass(frozen=True)
-class PartInfo:
-    code: str
-    description: str = ""
-    manufacturer: str = ""
-    manufacturer_code: str = ""
-
-
-def _build_part_master(boms: List[BomDocument]) -> Dict[str, PartInfo]:
-    """
-    Estrae description/manufacturer/manufacturer_code “best effort”.
-    Se più BOM danno info diverse, prendiamo la prima non-vuota incontrata.
-    """
-    out: Dict[str, PartInfo] = {}
-    def _candidate_keys(code: str, rev: str = "") -> List[str]:
-        keys: List[str] = []
-        raw = (code or "").strip()
-        if raw:
-            keys.append(raw)
-
-        canon = canonicalize_pn(raw, rev=canonicalize_rev(rev or "") or None)
-        if canon and canon not in keys:
-            keys.append(canon)
-        return keys
-
-    def _merge(code_key: str, desc: str, mfr: str, mfr_code: str) -> None:
-        prev = out.get(code_key)
-        if prev is None:
-            out[code_key] = PartInfo(
-                code=code_key,
-                description=desc,
-                manufacturer=mfr,
-                manufacturer_code=mfr_code,
-            )
-            return
-        out[code_key] = PartInfo(
-            code=code_key,
-            description=prev.description or desc,
-            manufacturer=prev.manufacturer or mfr,
-            manufacturer_code=prev.manufacturer_code or mfr_code,
-        )
-
-
-    for b in boms:
-        for ln in getattr(b, "lines", []) or []:
-            if not isinstance(ln, NormalizedBomLine):
-                continue
-
-            code = (getattr(ln, "internal_code", "") or "").strip()
-            if not code:
-                continue
-
-            desc = (getattr(ln, "description", "") or "").strip()
-            mfr = (getattr(ln, "manufacturer", "") or "").strip()
-            mfr_code = (getattr(ln, "manufacturer_code", "") or "").strip()
-            rev = (getattr(ln, "rev", "") or "").strip()
-
-            for code_key in _candidate_keys(code, rev):
-                _merge(code_key, desc, mfr, mfr_code)
-
-
-
-    return out
+_LOG = logging.getLogger(__name__)
+_DEBUG_DIAG = os.getenv("MDP_DEBUG_DIAGNOSTICS", "0").strip() in {"1", "true", "True"}
 
 
 def _find_pbs_root_row(pbs: Any) -> Tuple[int, Any]:
@@ -498,7 +437,7 @@ class ProjectContext:
         cycles = _detect_bom_cycles_best_effort(bom_children)
 
         boms = list(getattr(result, "boms", []) or [])
-        part_master = _build_part_master(boms)
+        part_master = build_part_master(boms)
 
         # In PDF_ONLY non abbiamo PBS: per uniformità, impostiamo pbs_root = root manufacturing.
         ctx = cls(
@@ -535,6 +474,7 @@ class ProjectContext:
             pbs_node_by_code={},
             pbs_occurrences_by_code={},
         )
+        cls._emit_lookup_diagnostics(part_master, edges)
         return ctx
 
     @classmethod
@@ -544,7 +484,7 @@ class ProjectContext:
 
         # Master data dalle BOM (best effort)
         boms = list(getattr(result, "boms", []) or [])
-        part_master = _build_part_master(boms)
+        part_master = build_part_master(boms)
 
         # PBS indices (robusto, occurrence-based)
         pbs_root_code, pbs_root_rev = "", ""
@@ -662,7 +602,31 @@ class ProjectContext:
             pbs_node_by_code=pbs_first_row_by_code,
             pbs_occurrences_by_code=pbs_occ_by_code,
         )
+        cls._emit_lookup_diagnostics(part_master, edges)
         return ctx
+
+    def part_info_for(self, code: str, rev: str = "") -> Optional[PartInfo]:
+        return lookup_part_info(self.part_master, code, rev)
+
+    @staticmethod
+    def _emit_lookup_diagnostics(part_master: Dict[str, PartInfo], edges: List[Any]) -> None:
+        if not _DEBUG_DIAG:
+            return
+        total = 0
+        miss = 0
+        pairs: List[Tuple[str, str]] = []
+        for e in edges:
+            code = (getattr(e, "child_code", "") or "").strip()
+            rev = (getattr(e, "child_rev", "") or "").strip()
+            if not code:
+                continue
+            total += 1
+            if lookup_part_info(part_master, code, rev) is None:
+                miss += 1
+                pairs.append((code, rev))
+        pct = (100.0 * miss / total) if total else 0.0
+        sample = missing_lookup_samples(part_master, pairs, sample_size=20)
+        _LOG.info("[diag] part_master lookup misses: %s/%s (%.1f%%)%s", miss, total, pct, f" sample={sample}" if sample else "")
 
     @staticmethod
     def _build_indices_from_edges(

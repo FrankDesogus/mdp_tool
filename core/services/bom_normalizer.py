@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import math
+import os
 import re
+import logging
 from pathlib import Path
 from typing import Optional, Iterable, List
 
@@ -15,6 +17,9 @@ from core.domain.models import (
 
 # ✅ NEW: alias/canonicalizzazione codici (external -> internal)
 from core.services.code_aliases import canonicalize_code
+
+_LOG = logging.getLogger(__name__)
+_DEBUG_DIAG = os.getenv("MDP_DEBUG_DIAGNOSTICS", "0").strip() in {"1", "true", "True"}
 
 
 # --- regole base, estendibili ---
@@ -101,6 +106,8 @@ def build_bom_document(
     )
 
     lines: List[NormalizedBomLine] = []
+    raw_count = 0
+    raw_with_mfr = 0
 
     for raw_line in raw_lines:
         if not isinstance(raw_line, dict):
@@ -141,7 +148,9 @@ def build_bom_document(
 
         manufacturer = str(raw_line.get("manufacturer") or "").strip()
         manufacturer_code = str(raw_line.get("manufacturer_code") or "").strip()
-
+        raw_count += 1
+        if manufacturer:
+            raw_with_mfr += 1
         lines.append(
             NormalizedBomLine(
                 pos=pos,
@@ -162,6 +171,13 @@ def build_bom_document(
                 rev=rev,
             )
         )
+
+    if _DEBUG_DIAG:
+        norm_with_mfr = sum(1 for ln in lines if (ln.manufacturer or "").strip())
+        pct_raw = (100.0 * raw_with_mfr / raw_count) if raw_count else 0.0
+        pct_norm = (100.0 * norm_with_mfr / len(lines)) if lines else 0.0
+        _LOG.info("[diag] BOM manufacturer coverage: raw=%s/%s (%.1f%%) normalized=%s/%s (%.1f%%) file=%s", raw_with_mfr, raw_count, pct_raw, norm_with_mfr, len(lines), pct_norm, path.name)
+
 
     return BomDocument(
         path=path,

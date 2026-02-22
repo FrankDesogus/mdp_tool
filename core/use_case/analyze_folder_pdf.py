@@ -16,6 +16,7 @@ from core.parsers.bom_pdf import parse_bom_pdf_raw
 from core.domain.models import BomDocument
 from core.services.bom_normalizer import build_bom_document
 from core.services.exploder_pdf import ExplodePolicy, explode_boms_pdf
+from core.services.part_master import build_part_master, lookup_part_info
 
 # ✅ PN canonicalization
 from core.services.pn_canonical import canonicalize_pn, canonicalize_rev
@@ -331,36 +332,46 @@ def _write_graph_stats_csv(
     return len(rows)
 
 
-def _write_bom_explosion_tree_txt(explosion: object, out_path: Path) -> int:
+def _write_bom_explosion_tree_txt(explosion: object, out_path: Path, boms: Optional[list[object]] = None) -> int:
     if not explosion or not getattr(explosion, "edges", None):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text("(Explode vuoto)\n", encoding="utf-8")
         return 0
+
+    part_master = build_part_master(boms or [])
 
     lines: List[str] = []
     root = f"{getattr(explosion, 'root_code', '')} REV {getattr(explosion, 'root_rev', '')}"
     lines.append(f"ROOT: {root}")
     lines.append("")
 
+
     for e in getattr(explosion, "edges", []) or []:
         depth = int(getattr(e, "depth", 1) or 1)
         indent = "  " * max(0, depth - 1)
         description = (getattr(e, "description", "") or "").strip()
-        manufacturer = (getattr(e, "manufacturer", "") or "").strip()
-        manufacturer_code = (getattr(e, "manufacturer_code", "") or "").strip()
 
 
         parent = f"{getattr(e, 'parent_code', '')} REV {getattr(e, 'parent_rev', '')}"
-        child = f"{getattr(e, 'child_code', '')} REV {getattr(e, 'child_rev', '') or '-'}"
+        child_code = (getattr(e, "child_code", "") or "").strip()
+        child_rev = (getattr(e, "child_rev", "") or "").strip()
+        child = f"{child_code} REV {child_rev or '-'}"
         qty = _fmt_qty(getattr(e, "qty", ""))
 
+        info = lookup_part_info(part_master, child_code, child_rev)
+        desc = (("" if info is None else info.description) or (getattr(e, "description", "") or "")).strip()
+        mfr = (("" if info is None else info.manufacturer) or (getattr(e, "manufacturer", "") or "")).strip()
+        mfr_code = (("" if info is None else info.manufacturer_code) or (getattr(e, "manufacturer_code", "") or "")).strip()
+
+
         meta_parts = []
-        if description:
-            meta_parts.append(f"desc={description}")
-        if manufacturer:
-            meta_parts.append(f"mfr={manufacturer}")
-        if manufacturer_code:
-            meta_parts.append(f"mfr_code={manufacturer_code}")
+        if desc:
+            meta_parts.append(f"desc={desc}")
+        if mfr:
+            meta_parts.append(f"mfr={mfr}")
+        if mfr_code:
+            meta_parts.append(f"mfr_code={mfr_code}")
+
         meta = f" [{' | '.join(meta_parts)}]" if meta_parts else ""
 
         lines.append(f"{indent}- {child} x{qty}{meta}   (parent: {parent})")
@@ -678,7 +689,7 @@ class AnalyzeFolderPdfUseCase:
         traces_csv = diag_dir / f"explode_resolution_traces__{safe_root}.csv"
         missing_csv = diag_dir / f"explode_missing_edges__{safe_root}.csv"
 
-        _write_bom_explosion_tree_txt(exp, tree_txt)
+        _write_bom_explosion_tree_txt(exp, tree_txt, boms=list(getattr(result, "boms", []) or []))
         _write_bom_flat_qty_csv(exp, flat_csv)
         _write_explode_resolution_traces_csv(exp, traces_csv)
         _write_missing_edges_csv(exp, missing_csv)

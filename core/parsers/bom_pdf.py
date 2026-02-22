@@ -31,6 +31,8 @@ _RX_PRINT_DATE = re.compile(
 #  - default ON
 #  - set BOM_PDF_LAYOUT_FALLBACK=0 to disable
 _ENABLE_LAYOUT_FALLBACK = os.getenv("BOM_PDF_LAYOUT_FALLBACK", "1").strip() not in {"0", "false", "False"}
+_DEBUG_PDF = os.getenv("BOM_PDF_DEBUG", "0").strip() in {"1", "true", "True"}
+_LOG = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -268,10 +270,10 @@ def _best_guess_key(token: str) -> Optional[str]:
         return "type"
     if "note" in t:
         return "notes"
-    if "manufactur" in t or "produtt" in t or "ditta" in t or "company" in t:
-        return "manufacturer"
     if "costrutt" in t or ("manufactur" in t and "code" in t) or "trade" in t:
         return "manufacturer_code"
+    if "manufactur" in t or "produtt" in t or "ditta" in t or "company" in t:
+        return "manufacturer"
 
     return None
 
@@ -535,12 +537,14 @@ def _is_numeric_pos_list(pos_list: List[str]) -> bool:
     return all((p or "").strip().isdigit() for p in pos_list if (p or "").strip())
 
 
-def _extract_lines_from_tables(pdf: pdfplumber.PDF, aggressive: bool) -> Tuple[List[Dict[str, Any]], bool]:
+def _extract_lines_from_tables(pdf: pdfplumber.PDF, aggressive: bool) -> Tuple[List[Dict[str, Any]], bool, List[str]]:
     """
     Ritorna (lines, found_any_body_table).
     """
     lines: List[Dict[str, Any]] = []
     found_body = False
+    debug_notes: List[str] = []
+
 
     for page in pdf.pages:
         tables = page.extract_tables(table_settings=TABLE_SETTINGS_AGGRESSIVE) if aggressive else page.extract_tables()
@@ -562,6 +566,8 @@ def _extract_lines_from_tables(pdf: pdfplumber.PDF, aggressive: bool) -> Tuple[L
 
             found_body = True
             col_map = _build_col_map(header_row)
+            if _DEBUG_PDF:
+                debug_notes.append(f"[tables] page={page.page_number} aggressive={int(aggressive)} col_map={col_map}")
 
             if not _validate_minimum_colmap(col_map):
                 continue
@@ -653,8 +659,7 @@ def _extract_lines_from_tables(pdf: pdfplumber.PDF, aggressive: bool) -> Tuple[L
 
                     lines.append(item)
 
-    return lines, found_body
-
+    return lines, found_body, debug_notes
 
 # ============================================================
 # NEW: Misalignment detection (Rev -> Qty, shift, etc.)
@@ -731,10 +736,10 @@ def _header_key_from_word(text: str) -> Optional[str]:
         return "qty"
     if t in {"note", "notes"}:
         return "notes"
-    if "manufactur" in t or "produtt" in t or "company" in t or "ditta" in t:
-        return "manufacturer"
     if "manufactur" in t and "code" in t:
         return "manufacturer_code"
+    if "manufactur" in t or "produtt" in t or "company" in t or "ditta" in t:
+        return "manufacturer"
     if t == "trade":
         return "manufacturer_code"
 
@@ -971,12 +976,13 @@ def parse_bom_pdf_raw(path: Path) -> dict:
             raise ValueError(f"BOM PDF senza header riconoscibile (code/rev): {path.name}")
 
         # 1) Tables standard
-        lines, found_body = _extract_lines_from_tables(pdf, aggressive=False)
-
+        lines, found_body, table_debug = _extract_lines_from_tables(pdf, aggressive=False)
         # 2) Tables aggressive fallback
         if not lines:
-            lines, found_body_aggr = _extract_lines_from_tables(pdf, aggressive=True)
+            lines, found_body_aggr, table_debug_aggr = _extract_lines_from_tables(pdf, aggressive=True)
             found_body = found_body or found_body_aggr
+            table_debug.extend(table_debug_aggr)
+
 
         # 3) Text fallback (POS-based)
         #    Nota: questo NON prenderà righe "Disegno" (perché non hanno POS).
@@ -998,6 +1004,12 @@ def parse_bom_pdf_raw(path: Path) -> dict:
                 lines = layout_lines
             else:
                 warnings.extend(layout_warn)
+
+        if _DEBUG_PDF and table_debug:
+            warnings.extend(table_debug)
+            for n in table_debug:
+                _LOG.info(n)
+
 
         if not lines:
             if found_body:
