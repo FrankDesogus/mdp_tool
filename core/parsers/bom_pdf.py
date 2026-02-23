@@ -27,7 +27,8 @@ _RX_PRINT_DATE = re.compile(
     r"(?:Data di Stampa|Printing Date)\s*/?\s*[\r\n ]*(\d{2}/\d{2}/\d{4})",
     re.IGNORECASE,
 )
-_RX_ROOT_CODE_IN_TITLE = re.compile(r"\bE\d+\b", re.IGNORECASE)
+_RX_ROOT_CODE_IN_TITLE = re.compile(r"\b(E\d+)\b(?!-\d)", re.IGNORECASE)
+_RX_MALFORMED_ROOT_IN_TITLE = re.compile(r"\bE\d+-\d+\b", re.IGNORECASE)
 
 # Feature flag (safe rollout)
 #  - default ON
@@ -64,7 +65,7 @@ def extract_root_code_from_title(title: str) -> Optional[str]:
     m = _RX_ROOT_CODE_IN_TITLE.search(t)
     if not m:
         return None
-    return m.group(0).upper().strip()
+    return m.group(1).upper().strip()
 
 
 def _split_cell(cell: Any) -> List[str]:
@@ -1222,6 +1223,18 @@ def parse_bom_pdf_raw(path: Path) -> dict:
         if mt:
             header["title"] = mt.group(1).strip()
         header["root_code"] = extract_root_code_from_title(header.get("title", "")) or ""
+        if not header["root_code"]:
+            # fallback conservativo: prova dal campo code header (es. "E0029472 01")
+            header["root_code"] = extract_root_code_from_title(header.get("code", "")) or ""
+
+        if not header["root_code"] and _RX_MALFORMED_ROOT_IN_TITLE.search(clean_pdf_text(header.get("title", ""))):
+            warnings.append(
+                f"[root_code] titolo con codice malformato/non canonico: {header.get('title', '')!r}"
+            )
+        if header["root_code"] and ("-" in header["root_code"] or " " in header["root_code"]):
+            warnings.append(
+                f"[root_code] root_code non canonico={header['root_code']!r} title={header.get('title', '')!r}"
+            )
 
         md = _RX_PRINT_DATE.search(text)
         if md:

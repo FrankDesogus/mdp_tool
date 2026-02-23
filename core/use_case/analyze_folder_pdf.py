@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import os
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -18,6 +19,8 @@ from core.services.part_master import build_part_master, lookup_part_info
 
 # ✅ PN canonicalization
 from core.services.pn_canonical import canonicalize_pn, canonicalize_rev
+
+_DEBUG_PDF = os.getenv("BOM_PDF_DEBUG", "0").strip() in {"1", "true", "True"}
 
 
 # -------------------------
@@ -88,6 +91,26 @@ def _fmt_qty(q: object) -> str:
     except Exception:
         pass
     return str(q)
+
+
+def _select_canonical_root_code(header: dict) -> str:
+    """
+    Source of truth per la root della BOM:
+      1) header.root_code (se già valorizzato)
+      2) estrazione da header.title
+      3) fallback conservativo da header.code (es. "E0029472 01")
+    """
+    root = str(header.get("root_code") or "").strip().upper()
+    if root:
+        return root
+
+    title = str(header.get("title") or "")
+    root = extract_root_code_from_title(title) or ""
+    if root:
+        return root
+
+    code = str(header.get("code") or "")
+    return extract_root_code_from_title(code) or ""
 
 
 def build_bom_graph(
@@ -557,14 +580,24 @@ class AnalyzeFolderPdfUseCase:
                     _add_issue("WARN", f"[BOM_PDF_PARSE_WARN] {p.name}: {w}", p, "BOM_PDF_PARSE")
 
                 header_title = str(header.get("title") or "")
+                header_code_raw = str(header.get("code") or "")
                 header_rev = str(header.get("rev") or header.get("revision") or "")
-                root_code = str(header.get("root_code") or "").strip() or (extract_root_code_from_title(header_title) or "")
-                header_code_effective = root_code or str(header.get("code") or "")
+                root_code = _select_canonical_root_code(header)
+                header_code_effective = root_code or header_code_raw
 
-                _log(
-                    "DEBUG",
-                    f"[PDF_DEBUG] file={p.name} title_raw={header_title!r} root_code={root_code or '(none)'} rev_header={header_rev or '(none)'}",
-                )
+                if _DEBUG_PDF:
+                    _log(
+                        "DEBUG",
+                        f"[PDF_DEBUG] file={p.name} title_raw={header_title!r} header_code={header_code_raw!r} "
+                        f"root_code={root_code or '(none)'} rev_header={header_rev or '(none)'}",
+                    )
+                if root_code and ("-" in root_code or " " in root_code):
+                    _add_issue(
+                        "WARN",
+                        f"[ROOT_CODE] root_code non canonico: {root_code!r} (title={header_title!r})",
+                        p,
+                        "ROOT_CODE_NON_CANONICAL",
+                    )
 
                 bom = build_bom_document(
                     path=p,
@@ -625,11 +658,19 @@ class AnalyzeFolderPdfUseCase:
             header_nodes=header_nodes,
         )
 
-        if roots:
+        if roots and _DEBUG_PDF:
             candidates = ", ".join(f"{c}:{r or '-'}" for c, r in roots)
             _log("DEBUG", f"[ROOT_DEBUG] root_candidates=[{candidates}]")
-        else:
+        elif _DEBUG_PDF:
             _log("DEBUG", "[ROOT_DEBUG] root_candidates=[]")
+
+        if _DEBUG_PDF:
+            graph_nodes = set(header_nodes) | set(parents_of.keys()) | set(children_of.keys())
+            dash_nodes = sorted(n for n in graph_nodes if "-01" in (n or ""))
+            _log(
+                "DEBUG",
+                f"[GRAPH_DEBUG] nodes={len(graph_nodes)} nodes_with_-01={len(dash_nodes)} sample={dash_nodes[:20]}",
+            )
 
         if not roots:
             _add_issue(
@@ -670,13 +711,15 @@ class AnalyzeFolderPdfUseCase:
 
         root_code, root_rev = roots[0]
         result.roots = [(root_code, root_rev)]
-        _log("DEBUG", f"[ROOT_DEBUG] root_selected={root_code} rev={root_rev or '(auto)'}")
+        if _DEBUG_PDF:
+            _log("DEBUG", f"[ROOT_DEBUG] root_selected={root_code} rev={root_rev or '(auto)'}")
         rows_for_root = sum(
             len(getattr(b, "lines", []) or [])
             for b in bom_docs
             if _norm_key(getattr(getattr(b, "header", None), "code", "")) == _norm_key(root_code)
         )
-        _log("DEBUG", f"[ROOT_DEBUG] bom_rows_for_selected_root={rows_for_root}")
+        if _DEBUG_PDF:
+            _log("DEBUG", f"[ROOT_DEBUG] bom_rows_for_selected_root={rows_for_root}")
         _add_issue(
             "INFO",
             f"[ROOT_INFERENCE] Root unica: {root_code} REV {root_rev or '(auto)'}",
