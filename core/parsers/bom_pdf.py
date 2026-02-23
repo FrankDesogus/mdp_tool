@@ -43,6 +43,15 @@ def _norm(s: Any) -> str:
     return ("" if s is None else str(s)).strip()
 
 
+def clean_pdf_text(text: Any) -> str:
+    s = "" if text is None else str(text)
+    s = re.sub(r"\(cid:\d+\)", "", s)
+    s = s.replace("\u00A0", " ")
+    s = s.replace("\t", " ")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
 def _split_cell(cell: Any) -> List[str]:
     """
     pdfplumber spesso restituisce dati multi-riga in una sola cella con '\n'.
@@ -841,7 +850,7 @@ def _build_x_columns_from_header(header_words: List[Dict[str, Any]], page_width:
 def _assign_row_words_to_cols(row_words: List[Dict[str, Any]], cols: List[Tuple[str, float, float]]) -> Dict[str, str]:
     buckets: Dict[str, List[str]] = {k: [] for (k, _, _) in cols}
     for w in row_words:
-        txt = _norm(w.get("text"))
+        txt = clean_pdf_text(w.get("text"))
         if not txt:
             continue
         xc = (float(w["x0"]) + float(w["x1"])) / 2.0
@@ -856,6 +865,184 @@ def _assign_row_words_to_cols(row_words: List[Dict[str, Any]], cols: List[Tuple[
         s = re.sub(r"\s+", " ", s).strip()
         out[k] = s
     return out
+
+
+# ============================================================
+# NEW: Grid-layout fallback (vertical lines + word-to-column)
+# ============================================================
+_GRID_TABLE_Y_MIN = 170.0
+_GRID_TABLE_Y_MAX = 800.0
+_GRID_MIN_VERTICAL_LINES = 8
+_GRID_X_CLUSTER_TOL = 2.0
+_GRID_Y_TOL = 3.0
+
+
+def _cluster_positions(values: List[float], tol: float) -> List[float]:
+    if not values:
+        return []
+    vals = sorted(values)
+    clusters: List[List[float]] = [[vals[0]]]
+    for v in vals[1:]:
+        if abs(v - clusters[-1][-1]) <= tol:
+            clusters[-1].append(v)
+        else:
+            clusters.append([v])
+    return [sum(c) / len(c) for c in clusters]
+
+
+def _extract_vertical_grid_lines(page: pdfplumber.page.Page, y_min: float, y_max: float) -> List[float]:
+    xs: List[float] = []
+    for ln in page.lines or []:
+        x0 = float(ln.get("x0", 0.0))
+        x1 = float(ln.get("x1", 0.0))
+        if abs(x0 - x1) >= 1.0:
+            continue
+        top = float(ln.get("top", min(float(ln.get("y0", 0.0)), float(ln.get("y1", 0.0)))))
+        bottom = float(ln.get("bottom", max(float(ln.get("y0", 0.0)), float(ln.get("y1", 0.0)))))
+        if bottom < y_min or top > y_max:
+            continue
+        xs.append((x0 + x1) / 2.0)
+    return _cluster_positions(xs, tol=_GRID_X_CLUSTER_TOL)
+
+
+def _grid_column_index(vlines: List[float], x_mid: float) -> Optional[int]:
+    for i in range(len(vlines) - 1):
+        if vlines[i] <= x_mid < vlines[i + 1]:
+            return i
+    return None
+
+
+def _build_grid_col_map(header_words: List[Dict[str, Any]], vlines: List[float]) -> Dict[str, int]:
+    col_map: Dict[str, int] = {}
+    for w in sorted(header_words, key=lambda ww: (float(ww.get("top", 0.0)), float(ww.get("x0", 0.0)))):
+        txt = clean_pdf_text(w.get("text"))
+        k = _header_key_from_word(txt)
+        if not k:
+            continue
+        x_mid = (float(w["x0"]) + float(w["x1"])) / 2.0
+        col_idx = _grid_column_index(vlines, x_mid)
+        if col_idx is None:
+            continue
+        if k not in col_map:
+            col_map[k] = col_idx
+    return col_map
+
+
+def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str, Any]], List[str]]:
+    warnings: List[str] = []
+    lines: List[Dict[str, Any]] = []
+
+    for page_idx, page in enumerate(pdf.pages):
+        vlines = _extract_vertical_grid_lines(page, _GRID_TABLE_Y_MIN, _GRID_TABLE_Y_MAX)
+        if _DEBUG_PDF:
+            warnings.append(f"[grid] page {page_idx+1}: vlines={len(vlines)}")
+        if len(vlines) < _GRID_MIN_VERTICAL_LINES:
+            warnings.append(f"[grid] page {page_idx+1}: saltata (linee verticali insufficienti: {len(vlines)}).")
+            continue
+
+        words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
+        words = [
+            w
+            for w in words
+            if _GRID_TABLE_Y_MIN <= float(w.get("top", 0.0)) <= _GRID_TABLE_Y_MAX and clean_pdf_text(w.get("text"))
+        ]
+        if not words:
+            warnings.append(f"[grid] page {page_idx+1}: nessuna word nella banda tabella.")
+            continue
+
+        hb = _find_table_header_band(words)
+        if not hb:
+            warnings.append(f"[grid] page {page_idx+1}: header tabella non trovato.")
+            continue
+        hy0, hy1 = hb
+        header_words = [w for w in words if hy0 <= float(w.get("top", 0.0)) <= hy1]
+        col_map = _build_grid_col_map(header_words, vlines)
+        if not _validate_minimum_colmap(col_map):
+            warnings.append(f"[grid] page {page_idx+1}: col_map insufficiente={col_map}")
+            continue
+
+        body_words = [w for w in words if float(w.get("top", 0.0)) > hy1]
+        physical_rows = _cluster_words_by_y(body_words, y_tol=_GRID_Y_TOL)
+
+        row_cells: List[List[str]] = []
+        for rw in physical_rows:
+            cells = [""] * (len(vlines) - 1)
+            for w in sorted(rw, key=lambda ww: float(ww.get("x0", 0.0))):
+                txt = clean_pdf_text(w.get("text"))
+                if not txt:
+                    continue
+                x_mid = (float(w["x0"]) + float(w["x1"])) / 2.0
+                col_idx = _grid_column_index(vlines, x_mid)
+                if col_idx is None:
+                    continue
+                cells[col_idx] = f"{cells[col_idx]} {txt}".strip() if cells[col_idx] else txt
+            if any(cells):
+                row_cells.append(cells)
+
+        logical_rows: List[List[str]] = []
+        current: Optional[List[str]] = None
+        pos_idx = col_map.get("pos", -1)
+
+        for cells in row_cells:
+            pos_raw = clean_pdf_text(cells[pos_idx]) if 0 <= pos_idx < len(cells) else ""
+            pos_is_new = bool(re.fullmatch(r"\d{4}", pos_raw)) or pos_raw.lower() == "null"
+
+            has_payload = any(clean_pdf_text(c) for i, c in enumerate(cells) if i != pos_idx)
+            if pos_is_new:
+                if current:
+                    logical_rows.append(current)
+                current = cells[:]
+                continue
+
+            if current is not None and has_payload:
+                for i, val in enumerate(cells):
+                    vv = clean_pdf_text(val)
+                    if not vv:
+                        continue
+                    if current[i]:
+                        current[i] = f"{current[i]}\n{vv}"
+                    else:
+                        current[i] = vv
+            elif has_payload:
+                current = cells[:]
+
+        if current:
+            logical_rows.append(current)
+
+        if _DEBUG_PDF:
+            warnings.append(f"[grid] page {page_idx+1}: physical_rows={len(row_cells)} logical_rows={len(logical_rows)}")
+
+        for cells in logical_rows:
+            def cval(key: str) -> str:
+                idx = col_map.get(key, -1)
+                if idx < 0 or idx >= len(cells):
+                    return ""
+                return clean_pdf_text(cells[idx])
+
+            pos = _normalize_pos(cval("pos"))
+            code = cval("code")
+            if not code:
+                continue
+
+            item: Dict[str, Any] = {
+                "pos": "" if pos.lower() == "null" else pos,
+                "internal_code": code,
+                "rev": cval("rev"),
+                "description": cval("desc"),
+                "um": cval("um"),
+                "qty": cval("qty") or None,
+            }
+
+            for optional_key in ("type", "notes", "manufacturer", "manufacturer_code"):
+                v = cval(optional_key)
+                if v:
+                    item[optional_key] = v
+
+            lines.append(item)
+
+    if not lines:
+        warnings.append("[grid] Nessuna riga BOM estratta con grid-layout parser.")
+    return lines, warnings
 
 
 def _extract_lines_from_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -991,20 +1178,30 @@ def parse_bom_pdf_raw(path: Path) -> dict:
             pages_text = [(p.extract_text() or "") for p in pdf.pages]
             lines = _parse_lines_from_text(pages_text)
 
-        # 4) NEW: Layout fallback (words/x-y) when:
+        # 4) NEW: grid-layout fallback, then legacy layout fallback when:
         #    - no lines
         #    - or strong misalignment detected
         if _ENABLE_LAYOUT_FALLBACK and (not lines or _looks_like_misaligned_qty(lines)):
-            layout_lines, layout_warn = _extract_lines_from_layout(pdf)
-            if layout_lines:
+            grid_lines, grid_warn = _extract_lines_from_grid_layout(pdf)
+            if grid_lines:
                 if lines:
-                    warnings.append("Fallback layout-based attivato (incoerenza tabelle: possibile misalignment Rev->Qty).")
+                    warnings.append("Fallback grid-layout attivato (incoerenza tabelle: possibile misalignment Rev->Qty).")
                 else:
-                    warnings.append("Fallback layout-based attivato (nessuna riga da tables/text).")
-                warnings.extend(layout_warn)
-                lines = layout_lines
+                    warnings.append("Fallback grid-layout attivato (nessuna riga da tables/text).")
+                warnings.extend(grid_warn)
+                lines = grid_lines
             else:
-                warnings.extend(layout_warn)
+                warnings.extend(grid_warn)
+                layout_lines, layout_warn = _extract_lines_from_layout(pdf)
+                if layout_lines:
+                    if lines:
+                        warnings.append("Fallback layout-based attivato (grid fallback vuoto; possibile misalignment Rev->Qty).")
+                    else:
+                        warnings.append("Fallback layout-based attivato (grid fallback vuoto e nessuna riga da tables/text).")
+                    warnings.extend(layout_warn)
+                    lines = layout_lines
+                else:
+                    warnings.extend(layout_warn)
 
         if _DEBUG_PDF and table_debug:
             warnings.extend(table_debug)
