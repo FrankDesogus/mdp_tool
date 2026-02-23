@@ -22,6 +22,12 @@ _LOG = logging.getLogger(__name__)
 _DEBUG_DIAG = os.getenv("MDP_DEBUG_DIAGNOSTICS", "0").strip() in {"1", "true", "True"}
 
 
+def _clean_key_text(value: object) -> str:
+    s = "" if value is None else str(value)
+    s = s.replace("\r", " ").replace("\n", " ")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
 # --- regole base, estendibili ---
 _REF_UNITS = {"REF", "REFERENCE", "DOC", "DOCUMENT", "DWG"}
 
@@ -113,26 +119,26 @@ def build_bom_document(
         if not isinstance(raw_line, dict):
             raise TypeError(f"BOM normalizer: riga non-dict: {type(raw_line)!r}")
 
-        pos = str(raw_line.get("pos") or "").strip()
+        pos = _clean_key_text(raw_line.get("pos") or "")
 
         # NEW: tipo riga (per distinguere documenti vs materiali)
-        line_type = str(raw_line.get("type") or "").strip()
+        line_type = _clean_key_text(raw_line.get("type") or "")
 
         # component code nella tabella = INTERNAL CODE
-        internal_code = str(
+        internal_code = _clean_key_text(
             raw_line.get("internal_code")
             or raw_line.get("code")          # fallback eventuale
             or ""
-        ).strip()
+        )
 
         # ✅ NEW: canonicalizza internal_code (codice esterno -> codice interno)
         if internal_code:
             internal_code = canonicalize_code(internal_code)
 
         description = str(raw_line.get("description") or "").strip()
-        rev = str(raw_line.get("rev") or "").strip()
+        rev = _clean_key_text(raw_line.get("rev") or "")
 
-        unit = normalize_unit(raw_line.get("um") or raw_line.get("unit"))
+        unit = normalize_unit(_clean_key_text(raw_line.get("um") or raw_line.get("unit")))
         qty = parse_qty(raw_line.get("qty"))
 
         # NEW: classificazione anche su base "type" / descrizione

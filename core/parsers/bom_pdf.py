@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import unicodedata
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pdfplumber
 
@@ -27,6 +27,7 @@ _RX_PRINT_DATE = re.compile(
     r"(?:Data di Stampa|Printing Date)\s*/?\s*[\r\n ]*(\d{2}/\d{2}/\d{4})",
     re.IGNORECASE,
 )
+_RX_ROOT_CODE_IN_TITLE = re.compile(r"\bE\d+\b", re.IGNORECASE)
 
 # Feature flag (safe rollout)
 #  - default ON
@@ -50,6 +51,20 @@ def clean_pdf_text(text: Any) -> str:
     s = s.replace("\t", " ")
     s = re.sub(r"\s+", " ", s)
     return s.strip()
+
+
+def extract_root_code_from_title(title: str) -> Optional[str]:
+    """
+    Estrae il root code dal titolo BOM.
+    Regola: primo token che matcha E<digits> (es. "E0029472 01-03" -> "E0029472").
+    """
+    t = clean_pdf_text(title)
+    if not t:
+        return None
+    m = _RX_ROOT_CODE_IN_TITLE.search(t)
+    if not m:
+        return None
+    return m.group(0).upper().strip()
 
 
 def _split_cell(cell: Any) -> List[str]:
@@ -526,10 +541,15 @@ def _get_cell_lines(row: List[Any], idx: int) -> List[str]:
     return _split_cell(cell)
 
 
-def _align_by_pos(pos_list: List[str], cols: List[List[str]]) -> Tuple[List[str], List[List[str]]]:
+def _align_by_pos(
+    pos_list: List[str],
+    cols: List[List[str]],
+    *,
+    multiline_allowed_idx: Optional[Set[int]] = None,
+) -> Tuple[List[str], List[List[str]]]:
     n = len(pos_list)
 
-    def norm_len(a: List[str]) -> List[str]:
+    def norm_len(a: List[str], *, idx: int = -1) -> List[str]:
         if len(a) < n:
             return a + [""] * (n - len(a))
         if len(a) > n:
@@ -537,13 +557,13 @@ def _align_by_pos(pos_list: List[str], cols: List[List[str]]) -> Tuple[List[str]
             # concatenandoli sull'ultima riga logica, invece di troncarli.
             head = a[:n]
             tail = [x for x in a[n:] if x]
-            if tail and n > 0:
+            if tail and n > 0 and idx in (multiline_allowed_idx or set()):
                 head[-1] = (head[-1] + "\n" if head[-1] else "") + "\n".join(tail)
             return head
         return a
 
-    pos_list = norm_len(pos_list)
-    cols = [norm_len(c) for c in cols]
+    pos_list = norm_len(pos_list, idx=-1)
+    cols = [norm_len(c, idx=i) for i, c in enumerate(cols)]
     return pos_list, cols
 
 
@@ -640,7 +660,16 @@ def _extract_lines_from_tables(pdf: pdfplumber.PDF, aggressive: bool) -> Tuple[L
                 # multi-line expansion (POS è la base)
                 n = len(pos_list)
                 pos_list = [p.strip() for p in pos_list]
-                pos_list, cols_split = _align_by_pos(pos_list, cols_split)
+                multiline_allowed_idx = {
+                    col_map[k]
+                    for k in ("desc", "notes", "manufacturer", "manufacturer_code")
+                    if k in col_map
+                }
+                pos_list, cols_split = _align_by_pos(
+                    pos_list,
+                    cols_split,
+                    multiline_allowed_idx=multiline_allowed_idx,
+                )
 
                 for i in range(n):
                     pos = _normalize_pos((pos_list[i] or "").strip())
@@ -1009,6 +1038,11 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
         logical_rows: List[List[str]] = []
         current: Optional[List[str]] = None
         pos_idx = col_map.get("pos", -1)
+        merge_allowed_idx = {
+            col_map[k]
+            for k in ("desc", "notes", "manufacturer", "manufacturer_code", "type")
+            if k in col_map
+        }
 
         for cells in row_cells:
             pos_raw = clean_pdf_text(cells[pos_idx]) if 0 <= pos_idx < len(cells) else ""
@@ -1025,6 +1059,10 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
                 for i, val in enumerate(cells):
                     vv = clean_pdf_text(val)
                     if not vv:
+                        continue
+                    if i not in merge_allowed_idx:
+                        if not current[i]:
+                            current[i] = vv
                         continue
                     if current[i]:
                         current[i] = f"{current[i]}\n{vv}"
@@ -1165,7 +1203,7 @@ def _extract_lines_from_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str, Any]
 # Public API
 # ============================================================
 def parse_bom_pdf_raw(path: Path) -> dict:
-    header: Dict[str, str] = {"code": "", "rev": "", "title": "", "date": ""}
+    header: Dict[str, str] = {"code": "", "rev": "", "title": "", "date": "", "root_code": ""}
     warnings: List[str] = []
 
     with pdfplumber.open(path) as pdf:
@@ -1183,6 +1221,7 @@ def parse_bom_pdf_raw(path: Path) -> dict:
         mt = _RX_TITLE.search(text)
         if mt:
             header["title"] = mt.group(1).strip()
+        header["root_code"] = extract_root_code_from_title(header.get("title", "")) or ""
 
         md = _RX_PRINT_DATE.search(text)
         if md:
