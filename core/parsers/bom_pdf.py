@@ -533,7 +533,13 @@ def _align_by_pos(pos_list: List[str], cols: List[List[str]]) -> Tuple[List[str]
         if len(a) < n:
             return a + [""] * (n - len(a))
         if len(a) > n:
-            return a[:n]
+            # Mantieni eventuali contenuti extra (tipici delle colonne finali multilinea)
+            # concatenandoli sull'ultima riga logica, invece di troncarli.
+            head = a[:n]
+            tail = [x for x in a[n:] if x]
+            if tail and n > 0:
+                head[-1] = (head[-1] + "\n" if head[-1] else "") + "\n".join(tail)
+            return head
         return a
 
     pos_list = norm_len(pos_list)
@@ -748,10 +754,13 @@ def _header_key_from_word(text: str) -> Optional[str]:
         return "notes"
     if "manufactur" in t and "code" in t:
         return "manufacturer_code"
+    if t in {"trade", "tradename", "mfrcode", "mfrcode", "codicecostruttore", "codiceproduttore"}:
+        return "manufacturer_code"
     if "manufactur" in t or "produtt" in t or "company" in t or "ditta" in t:
         return "manufacturer"
-    if t == "trade":
-        return "manufacturer_code"
+    if t in {"compname", "companyname", "ragsoc", "ragionesociale", "ragsoccompname", "mfr", "maker"}:
+        return "manufacturer"
+
 
     return None
 
@@ -906,10 +915,26 @@ def _extract_vertical_grid_lines(page: pdfplumber.page.Page, y_min: float, y_max
 
 
 def _grid_column_index(vlines: List[float], x_mid: float) -> Optional[int]:
+    if len(vlines) < 2:
+        return None
+
     for i in range(len(vlines) - 1):
         if vlines[i] <= x_mid < vlines[i + 1]:
             return i
+        if x_mid >= vlines[-1]:
+            return len(vlines) - 1
     return None
+
+def _count_complete_tail_fields(lines: List[Dict[str, Any]]) -> int:
+    """
+    Conta quante righe hanno valorizzato almeno un campo "di coda" sensibile ai tagli.
+    """
+    c = 0
+    for ln in lines:
+        if _norm(ln.get("manufacturer")) or _norm(ln.get("manufacturer_code")):
+            c += 1
+    return c
+
 
 
 def _build_grid_col_map(header_words: List[Dict[str, Any]], vlines: List[float]) -> Dict[str, int]:
@@ -931,6 +956,8 @@ def _build_grid_col_map(header_words: List[Dict[str, Any]], vlines: List[float])
 def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str, Any]], List[str]]:
     warnings: List[str] = []
     lines: List[Dict[str, Any]] = []
+    total_physical_rows = 0
+    total_logical_rows = 0
 
     for page_idx, page in enumerate(pdf.pages):
         vlines = _extract_vertical_grid_lines(page, _GRID_TABLE_Y_MIN, _GRID_TABLE_Y_MAX)
@@ -1009,6 +1036,8 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
         if current:
             logical_rows.append(current)
 
+        total_physical_rows += len(row_cells)
+        total_logical_rows += len(logical_rows)
         if _DEBUG_PDF:
             warnings.append(f"[grid] page {page_idx+1}: physical_rows={len(row_cells)} logical_rows={len(logical_rows)}")
 
@@ -1039,6 +1068,10 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
                     item[optional_key] = v
 
             lines.append(item)
+
+    if _DEBUG_PDF:
+        warnings.append(f"[grid] totals: physical_rows={total_physical_rows} logical_rows={total_logical_rows}")
+
 
     if not lines:
         warnings.append("[grid] Nessuna riga BOM estratta con grid-layout parser.")
@@ -1163,50 +1196,80 @@ def parse_bom_pdf_raw(path: Path) -> dict:
         if not header["code"]:
             raise ValueError(f"BOM PDF senza header riconoscibile (code/rev): {path.name}")
 
+        parser_used = "tables"
+        parser_counts: Dict[str, int] = {}
+
+
         # 1) Tables standard
         lines, found_body, table_debug = _extract_lines_from_tables(pdf, aggressive=False)
+        parser_counts["tables"] = len(lines)
+
         # 2) Tables aggressive fallback
         if not lines:
+            parser_used = "tables-aggressive"
             lines, found_body_aggr, table_debug_aggr = _extract_lines_from_tables(pdf, aggressive=True)
+            parser_counts["tables-aggressive"] = len(lines)
             found_body = found_body or found_body_aggr
             table_debug.extend(table_debug_aggr)
 
-
         # 3) Text fallback (POS-based)
-        #    Nota: questo NON prenderà righe "Disegno" (perché non hanno POS).
         if not lines:
+            parser_used = "text"
             pages_text = [(p.extract_text() or "") for p in pdf.pages]
             lines = _parse_lines_from_text(pages_text)
+            parser_counts["text"] = len(lines)
 
-        # 4) NEW: grid-layout fallback, then legacy layout fallback when:
-        #    - no lines
-        #    - or strong misalignment detected
-        if _ENABLE_LAYOUT_FALLBACK and (not lines or _looks_like_misaligned_qty(lines)):
+        # 4) Smart layout fallbacks
+        #    Attiva grid/layout quando:
+        #    - non ci sono righe
+        #    - oppure sospetto misalignment qty
+        #    - oppure il grid produce più righe con colonne finali valorizzate.
+        should_try_layout = _ENABLE_LAYOUT_FALLBACK and (not lines or _looks_like_misaligned_qty(lines) or found_body)
+        if should_try_layout:
             grid_lines, grid_warn = _extract_lines_from_grid_layout(pdf)
-            if grid_lines:
-                if lines:
-                    warnings.append("Fallback grid-layout attivato (incoerenza tabelle: possibile misalignment Rev->Qty).")
-                else:
-                    warnings.append("Fallback grid-layout attivato (nessuna riga da tables/text).")
+            parser_counts["grid-layout"] = len(grid_lines)
+
+            prefer_grid = False
+            if grid_lines and not lines:
+                prefer_grid = True
+            elif grid_lines and lines:
+                base_tail = _count_complete_tail_fields(lines)
+                grid_tail = _count_complete_tail_fields(grid_lines)
+                prefer_grid = (grid_tail > base_tail) or (grid_tail == base_tail and len(grid_lines) > len(lines))
+
+            if prefer_grid:
+                warnings.append("Fallback grid-layout attivato (output più completo su colonne finali / multilinea).")
                 warnings.extend(grid_warn)
                 lines = grid_lines
-            else:
+                parser_used = "grid-layout"
+            elif not lines:
                 warnings.extend(grid_warn)
                 layout_lines, layout_warn = _extract_lines_from_layout(pdf)
+                parser_counts["layout-old"] = len(layout_lines)
                 if layout_lines:
-                    if lines:
-                        warnings.append("Fallback layout-based attivato (grid fallback vuoto; possibile misalignment Rev->Qty).")
-                    else:
-                        warnings.append("Fallback layout-based attivato (grid fallback vuoto e nessuna riga da tables/text).")
+                    warnings.append("Fallback layout-based attivato (grid fallback vuoto).")
                     warnings.extend(layout_warn)
                     lines = layout_lines
+                    parser_used = "layout-old"
                 else:
                     warnings.extend(layout_warn)
+            else:
+                warnings.extend(grid_warn)
+
 
         if _DEBUG_PDF and table_debug:
             warnings.extend(table_debug)
             for n in table_debug:
                 _LOG.info(n)
+        if _DEBUG_PDF:
+            warnings.append(f"[debug] parser_used={parser_used}")
+            for name in ("tables", "tables-aggressive", "text", "grid-layout", "layout-old"):
+                if name in parser_counts:
+                    warnings.append(f"[debug] rows[{name}]={parser_counts[name]}")
+            warnings.append(f"[debug] rows_final={len(lines)}")
+            sample = lines[0] if lines else {}
+            warnings.append(f"[debug] sample_record={sample}")
+
 
 
         if not lines:

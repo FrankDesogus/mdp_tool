@@ -1,289 +1,285 @@
 diff --git a/core/parsers/bom_pdf.py b/core/parsers/bom_pdf.py
-index 4e3f50388e8c6d77fb708b4e5e7377cee6afdb32..55e00cb8188358a924304a3ff7320ac9ea365cd6 100644
+index 55e00cb8188358a924304a3ff7320ac9ea365cd6..8e2f3c32a736f9a0dc6a0a1c23d3fd3cbc6871b9 100644
 --- a/core/parsers/bom_pdf.py
 +++ b/core/parsers/bom_pdf.py
-@@ -21,50 +21,59 @@ _RX_CODE_REV = re.compile(
-     r"(?:Codice\s*/\s*Code|Codice|Code)\s+([A-Z0-9 _.\-]+?)\s+"
-     r"(?:Revisione\s*/\s*Revision|Revisione|Revision)\s+([A-Z0-9]+)",
-     re.IGNORECASE,
- )
- _RX_TITLE = re.compile(r"(?:Descrizione\s*/\s*Description|Descrizione|Description)\s+(.+)", re.IGNORECASE)
- _RX_PRINT_DATE = re.compile(
-     r"(?:Data di Stampa|Printing Date)\s*/?\s*[\r\n ]*(\d{2}/\d{2}/\d{4})",
-     re.IGNORECASE,
- )
- 
- # Feature flag (safe rollout)
- #  - default ON
- #  - set BOM_PDF_LAYOUT_FALLBACK=0 to disable
- _ENABLE_LAYOUT_FALLBACK = os.getenv("BOM_PDF_LAYOUT_FALLBACK", "1").strip() not in {"0", "false", "False"}
- _DEBUG_PDF = os.getenv("BOM_PDF_DEBUG", "0").strip() in {"1", "true", "True"}
- _LOG = logging.getLogger(__name__)
- 
- 
- # ============================================================
- # Helpers
- # ============================================================
- def _norm(s: Any) -> str:
-     return ("" if s is None else str(s)).strip()
- 
- 
-+def clean_pdf_text(text: Any) -> str:
-+    s = "" if text is None else str(text)
-+    s = re.sub(r"\(cid:\d+\)", "", s)
-+    s = s.replace("\u00A0", " ")
-+    s = s.replace("\t", " ")
-+    s = re.sub(r"\s+", " ", s)
-+    return s.strip()
-+
-+
- def _split_cell(cell: Any) -> List[str]:
-     """
-     pdfplumber spesso restituisce dati multi-riga in una sola cella con '\n'.
-     """
-     if cell is None:
+@@ -511,51 +511,57 @@ TABLE_SETTINGS_AGGRESSIVE = {
+     "horizontal_strategy": "lines",
+     "snap_tolerance": 3,
+     "join_tolerance": 3,
+     "edge_min_length": 20,
+     "min_words_vertical": 1,
+     "min_words_horizontal": 1,
+     "intersection_tolerance": 3,
+     "text_tolerance": 3,
+ }
+
+
+ def _get_cell_lines(row: List[Any], idx: int) -> List[str]:
+     if idx < 0:
          return []
-     s = str(cell)
-     parts = [p.strip() for p in s.split("\n")]
-     return [p for p in parts if p and p.lower() != "null"]
- 
- 
- def _normalize_pos(pos: str) -> str:
-     p = (pos or "").strip()
-     if p.isdigit():
-         return p.zfill(4)
-     return p
- 
- def _looks_like_type_token(t: str) -> bool:
-     tt = (t or "").strip().lower()
-     if not tt:
+     cell = row[idx] if idx < len(row) else None
+     return _split_cell(cell)
+
+
+ def _align_by_pos(pos_list: List[str], cols: List[List[str]]) -> Tuple[List[str], List[List[str]]]:
+     n = len(pos_list)
+
+     def norm_len(a: List[str]) -> List[str]:
+         if len(a) < n:
+             return a + [""] * (n - len(a))
+         if len(a) > n:
+-            return a[:n]
++            # Mantieni eventuali contenuti extra (tipici delle colonne finali multilinea)
++            # concatenandoli sull'ultima riga logica, invece di troncarli.
++            head = a[:n]
++            tail = [x for x in a[n:] if x]
++            if tail and n > 0:
++                head[-1] = (head[-1] + "\n" if head[-1] else "") + "\n".join(tail)
++            return head
+         return a
+
+     pos_list = norm_len(pos_list)
+     cols = [norm_len(c) for c in cols]
+     return pos_list, cols
+
+
+ def _is_numeric_pos_list(pos_list: List[str]) -> bool:
+     if not pos_list:
          return False
-     # token molto corto (es. DD) o parole generiche documentali
-     if len(tt) <= 4:
-         return True
-     return tt in {"disegno", "drawing", "documento", "document", "doc", "dwg"}
-@@ -819,67 +828,245 @@ def _build_x_columns_from_header(header_words: List[Dict[str, Any]], page_width:
-             key_x[k] = x0
- 
-     if not key_x:
+     return all((p or "").strip().isdigit() for p in pos_list if (p or "").strip())
+
+
+ def _extract_lines_from_tables(pdf: pdfplumber.PDF, aggressive: bool) -> Tuple[List[Dict[str, Any]], bool, List[str]]:
+     """
+     Ritorna (lines, found_any_body_table).
+     """
+     lines: List[Dict[str, Any]] = []
+     found_body = False
+     debug_notes: List[str] = []
+
+
+     for page in pdf.pages:
+         tables = page.extract_tables(table_settings=TABLE_SETTINGS_AGGRESSIVE) if aggressive else page.extract_tables()
+         tables = tables or []
+@@ -726,54 +732,56 @@ def _header_key_from_word(text: str) -> Optional[str]:
+     Supporta mojibake e varianti IT/EN.
+     """
+     t = _norm_header_token(text)
+     if not t:
+         return None
+
+     # match diretti più comuni (incl. mojibake già normalizzato)
+     if t in {"pos", "riga", "item", "nr", "n"}:
+         return "pos"
+     if t in {"tipo", "type"}:
+         return "type"
+     if t in {"codice", "code", "materiale", "material", "pn", "partnumber"}:
+         return "code"
+     if t in {"rev", "revisione", "revision"} or "revis" in t:
+         return "rev"
+     if t in {"descrizione", "description", "desc"} or "descr" in t or "descrip" in t:
+         return "desc"
+     if t in {"um", "um.", "um", "unit", "unita", "uom"} or "unit" in t or t.startswith("um"):
+         return "um"
+     if _is_qty_header_token(text) or t in {"qty", "qta", "qt", "quant", "quantita"}:
+         return "qty"
+     if t in {"note", "notes"}:
+         return "notes"
+     if "manufactur" in t and "code" in t:
+         return "manufacturer_code"
++    if t in {"trade", "tradename", "mfrcode", "mfrcode", "codicecostruttore", "codiceproduttore"}:
++        return "manufacturer_code"
+     if "manufactur" in t or "produtt" in t or "company" in t or "ditta" in t:
+         return "manufacturer"
+-    if t == "trade":
+-        return "manufacturer_code"
++    if t in {"compname", "companyname", "ragsoc", "ragionesociale", "ragsoccompname", "mfr", "maker"}:
++        return "manufacturer"
+
+     return None
+
+
+ def _cluster_words_by_y(words: List[Dict[str, Any]], y_tol: float) -> List[List[Dict[str, Any]]]:
+     if not words:
          return []
- 
-     ordered = sorted(key_x.items(), key=lambda kv: kv[1])  # (key, x)
-     xs = [x for _, x in ordered]
-     keys = [k for k, _ in ordered]
- 
-     # bounds = midpoints
-     bounds: List[float] = [0.0]
-     for a, b in zip(xs, xs[1:]):
-         bounds.append((a + b) / 2.0)
-     bounds.append(float(page_width))
- 
-     cols: List[Tuple[str, float, float]] = []
-     for i, k in enumerate(keys):
-         cols.append((k, bounds[i], bounds[i + 1]))
- 
-     return cols
- 
- 
- def _assign_row_words_to_cols(row_words: List[Dict[str, Any]], cols: List[Tuple[str, float, float]]) -> Dict[str, str]:
-     buckets: Dict[str, List[str]] = {k: [] for (k, _, _) in cols}
-     for w in row_words:
--        txt = _norm(w.get("text"))
-+        txt = clean_pdf_text(w.get("text"))
-         if not txt:
+     words = sorted(words, key=lambda w: (float(w["top"]), float(w["x0"])))
+     rows: List[List[Dict[str, Any]]] = []
+     cur: List[Dict[str, Any]] = [words[0]]
+     cur_y = float(words[0]["top"])
+
+     for w in words[1:]:
+         y = float(w["top"])
+         if abs(y - cur_y) <= y_tol:
+             cur.append(w)
+         else:
+             rows.append(cur)
+             cur = [w]
+             cur_y = y
+     rows.append(cur)
+     return rows
+
+
+ def _find_table_header_band(page_words: List[Dict[str, Any]]) -> Optional[Tuple[float, float]]:
+@@ -884,75 +892,92 @@ def _cluster_positions(values: List[float], tol: float) -> List[float]:
+     clusters: List[List[float]] = [[vals[0]]]
+     for v in vals[1:]:
+         if abs(v - clusters[-1][-1]) <= tol:
+             clusters[-1].append(v)
+         else:
+             clusters.append([v])
+     return [sum(c) / len(c) for c in clusters]
+
+
+ def _extract_vertical_grid_lines(page: pdfplumber.page.Page, y_min: float, y_max: float) -> List[float]:
+     xs: List[float] = []
+     for ln in page.lines or []:
+         x0 = float(ln.get("x0", 0.0))
+         x1 = float(ln.get("x1", 0.0))
+         if abs(x0 - x1) >= 1.0:
              continue
-         xc = (float(w["x0"]) + float(w["x1"])) / 2.0
-         for k, x0, x1 in cols:
-             if x0 <= xc < x1:
-                 buckets[k].append(txt)
-                 break
- 
-     out: Dict[str, str] = {}
-     for k, parts in buckets.items():
-         s = " ".join(p for p in parts if p)
-         s = re.sub(r"\s+", " ", s).strip()
-         out[k] = s
-     return out
- 
- 
-+# ============================================================
-+# NEW: Grid-layout fallback (vertical lines + word-to-column)
-+# ============================================================
-+_GRID_TABLE_Y_MIN = 170.0
-+_GRID_TABLE_Y_MAX = 800.0
-+_GRID_MIN_VERTICAL_LINES = 8
-+_GRID_X_CLUSTER_TOL = 2.0
-+_GRID_Y_TOL = 3.0
+         top = float(ln.get("top", min(float(ln.get("y0", 0.0)), float(ln.get("y1", 0.0)))))
+         bottom = float(ln.get("bottom", max(float(ln.get("y0", 0.0)), float(ln.get("y1", 0.0)))))
+         if bottom < y_min or top > y_max:
+             continue
+         xs.append((x0 + x1) / 2.0)
+     return _cluster_positions(xs, tol=_GRID_X_CLUSTER_TOL)
+
+
+ def _grid_column_index(vlines: List[float], x_mid: float) -> Optional[int]:
++    if len(vlines) < 2:
++        return None
+     for i in range(len(vlines) - 1):
+         if vlines[i] <= x_mid < vlines[i + 1]:
+             return i
++    if x_mid >= vlines[-1]:
++        return len(vlines) - 1
+     return None
+
+
++def _count_complete_tail_fields(lines: List[Dict[str, Any]]) -> int:
++    """
++    Conta quante righe hanno valorizzato almeno un campo "di coda" sensibile ai tagli.
++    """
++    c = 0
++    for ln in lines:
++        if _norm(ln.get("manufacturer")) or _norm(ln.get("manufacturer_code")):
++            c += 1
++    return c
 +
 +
-+def _cluster_positions(values: List[float], tol: float) -> List[float]:
-+    if not values:
-+        return []
-+    vals = sorted(values)
-+    clusters: List[List[float]] = [[vals[0]]]
-+    for v in vals[1:]:
-+        if abs(v - clusters[-1][-1]) <= tol:
-+            clusters[-1].append(v)
-+        else:
-+            clusters.append([v])
-+    return [sum(c) / len(c) for c in clusters]
+ def _build_grid_col_map(header_words: List[Dict[str, Any]], vlines: List[float]) -> Dict[str, int]:
+     col_map: Dict[str, int] = {}
+     for w in sorted(header_words, key=lambda ww: (float(ww.get("top", 0.0)), float(ww.get("x0", 0.0)))):
+         txt = clean_pdf_text(w.get("text"))
+         k = _header_key_from_word(txt)
+         if not k:
+             continue
+         x_mid = (float(w["x0"]) + float(w["x1"])) / 2.0
+         col_idx = _grid_column_index(vlines, x_mid)
+         if col_idx is None:
+             continue
+         if k not in col_map:
+             col_map[k] = col_idx
+     return col_map
+
+
+ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str, Any]], List[str]]:
+     warnings: List[str] = []
+     lines: List[Dict[str, Any]] = []
++    total_physical_rows = 0
++    total_logical_rows = 0
+
+     for page_idx, page in enumerate(pdf.pages):
+         vlines = _extract_vertical_grid_lines(page, _GRID_TABLE_Y_MIN, _GRID_TABLE_Y_MAX)
+         if _DEBUG_PDF:
+             warnings.append(f"[grid] page {page_idx+1}: vlines={len(vlines)}")
+         if len(vlines) < _GRID_MIN_VERTICAL_LINES:
+             warnings.append(f"[grid] page {page_idx+1}: saltata (linee verticali insufficienti: {len(vlines)}).")
+             continue
+
+         words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
+         words = [
+             w
+             for w in words
+             if _GRID_TABLE_Y_MIN <= float(w.get("top", 0.0)) <= _GRID_TABLE_Y_MAX and clean_pdf_text(w.get("text"))
+         ]
+         if not words:
+             warnings.append(f"[grid] page {page_idx+1}: nessuna word nella banda tabella.")
+             continue
+
+         hb = _find_table_header_band(words)
+         if not hb:
+             warnings.append(f"[grid] page {page_idx+1}: header tabella non trovato.")
+             continue
+         hy0, hy1 = hb
+         header_words = [w for w in words if hy0 <= float(w.get("top", 0.0)) <= hy1]
+@@ -987,81 +1012,86 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
+             pos_raw = clean_pdf_text(cells[pos_idx]) if 0 <= pos_idx < len(cells) else ""
+             pos_is_new = bool(re.fullmatch(r"\d{4}", pos_raw)) or pos_raw.lower() == "null"
+
+             has_payload = any(clean_pdf_text(c) for i, c in enumerate(cells) if i != pos_idx)
+             if pos_is_new:
+                 if current:
+                     logical_rows.append(current)
+                 current = cells[:]
+                 continue
+
+             if current is not None and has_payload:
+                 for i, val in enumerate(cells):
+                     vv = clean_pdf_text(val)
+                     if not vv:
+                         continue
+                     if current[i]:
+                         current[i] = f"{current[i]}\n{vv}"
+                     else:
+                         current[i] = vv
+             elif has_payload:
+                 current = cells[:]
+
+         if current:
+             logical_rows.append(current)
+
++        total_physical_rows += len(row_cells)
++        total_logical_rows += len(logical_rows)
+         if _DEBUG_PDF:
+             warnings.append(f"[grid] page {page_idx+1}: physical_rows={len(row_cells)} logical_rows={len(logical_rows)}")
+
+         for cells in logical_rows:
+             def cval(key: str) -> str:
+                 idx = col_map.get(key, -1)
+                 if idx < 0 or idx >= len(cells):
+                     return ""
+                 return clean_pdf_text(cells[idx])
+
+             pos = _normalize_pos(cval("pos"))
+             code = cval("code")
+             if not code:
+                 continue
+
+             item: Dict[str, Any] = {
+                 "pos": "" if pos.lower() == "null" else pos,
+                 "internal_code": code,
+                 "rev": cval("rev"),
+                 "description": cval("desc"),
+                 "um": cval("um"),
+                 "qty": cval("qty") or None,
+             }
+
+             for optional_key in ("type", "notes", "manufacturer", "manufacturer_code"):
+                 v = cval(optional_key)
+                 if v:
+                     item[optional_key] = v
+
+             lines.append(item)
+
++    if _DEBUG_PDF:
++        warnings.append(f"[grid] totals: physical_rows={total_physical_rows} logical_rows={total_logical_rows}")
 +
-+
-+def _extract_vertical_grid_lines(page: pdfplumber.page.Page, y_min: float, y_max: float) -> List[float]:
-+    xs: List[float] = []
-+    for ln in page.lines or []:
-+        x0 = float(ln.get("x0", 0.0))
-+        x1 = float(ln.get("x1", 0.0))
-+        if abs(x0 - x1) >= 1.0:
-+            continue
-+        top = float(ln.get("top", min(float(ln.get("y0", 0.0)), float(ln.get("y1", 0.0)))))
-+        bottom = float(ln.get("bottom", max(float(ln.get("y0", 0.0)), float(ln.get("y1", 0.0)))))
-+        if bottom < y_min or top > y_max:
-+            continue
-+        xs.append((x0 + x1) / 2.0)
-+    return _cluster_positions(xs, tol=_GRID_X_CLUSTER_TOL)
-+
-+
-+def _grid_column_index(vlines: List[float], x_mid: float) -> Optional[int]:
-+    for i in range(len(vlines) - 1):
-+        if vlines[i] <= x_mid < vlines[i + 1]:
-+            return i
-+    return None
-+
-+
-+def _build_grid_col_map(header_words: List[Dict[str, Any]], vlines: List[float]) -> Dict[str, int]:
-+    col_map: Dict[str, int] = {}
-+    for w in sorted(header_words, key=lambda ww: (float(ww.get("top", 0.0)), float(ww.get("x0", 0.0)))):
-+        txt = clean_pdf_text(w.get("text"))
-+        k = _header_key_from_word(txt)
-+        if not k:
-+            continue
-+        x_mid = (float(w["x0"]) + float(w["x1"])) / 2.0
-+        col_idx = _grid_column_index(vlines, x_mid)
-+        if col_idx is None:
-+            continue
-+        if k not in col_map:
-+            col_map[k] = col_idx
-+    return col_map
-+
-+
-+def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str, Any]], List[str]]:
-+    warnings: List[str] = []
-+    lines: List[Dict[str, Any]] = []
-+
-+    for page_idx, page in enumerate(pdf.pages):
-+        vlines = _extract_vertical_grid_lines(page, _GRID_TABLE_Y_MIN, _GRID_TABLE_Y_MAX)
-+        if _DEBUG_PDF:
-+            warnings.append(f"[grid] page {page_idx+1}: vlines={len(vlines)}")
-+        if len(vlines) < _GRID_MIN_VERTICAL_LINES:
-+            warnings.append(f"[grid] page {page_idx+1}: saltata (linee verticali insufficienti: {len(vlines)}).")
-+            continue
-+
-+        words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
-+        words = [
-+            w
-+            for w in words
-+            if _GRID_TABLE_Y_MIN <= float(w.get("top", 0.0)) <= _GRID_TABLE_Y_MAX and clean_pdf_text(w.get("text"))
-+        ]
-+        if not words:
-+            warnings.append(f"[grid] page {page_idx+1}: nessuna word nella banda tabella.")
-+            continue
-+
-+        hb = _find_table_header_band(words)
-+        if not hb:
-+            warnings.append(f"[grid] page {page_idx+1}: header tabella non trovato.")
-+            continue
-+        hy0, hy1 = hb
-+        header_words = [w for w in words if hy0 <= float(w.get("top", 0.0)) <= hy1]
-+        col_map = _build_grid_col_map(header_words, vlines)
-+        if not _validate_minimum_colmap(col_map):
-+            warnings.append(f"[grid] page {page_idx+1}: col_map insufficiente={col_map}")
-+            continue
-+
-+        body_words = [w for w in words if float(w.get("top", 0.0)) > hy1]
-+        physical_rows = _cluster_words_by_y(body_words, y_tol=_GRID_Y_TOL)
-+
-+        row_cells: List[List[str]] = []
-+        for rw in physical_rows:
-+            cells = [""] * (len(vlines) - 1)
-+            for w in sorted(rw, key=lambda ww: float(ww.get("x0", 0.0))):
-+                txt = clean_pdf_text(w.get("text"))
-+                if not txt:
-+                    continue
-+                x_mid = (float(w["x0"]) + float(w["x1"])) / 2.0
-+                col_idx = _grid_column_index(vlines, x_mid)
-+                if col_idx is None:
-+                    continue
-+                cells[col_idx] = f"{cells[col_idx]} {txt}".strip() if cells[col_idx] else txt
-+            if any(cells):
-+                row_cells.append(cells)
-+
-+        logical_rows: List[List[str]] = []
-+        current: Optional[List[str]] = None
-+        pos_idx = col_map.get("pos", -1)
-+
-+        for cells in row_cells:
-+            pos_raw = clean_pdf_text(cells[pos_idx]) if 0 <= pos_idx < len(cells) else ""
-+            pos_is_new = bool(re.fullmatch(r"\d{4}", pos_raw)) or pos_raw.lower() == "null"
-+
-+            has_payload = any(clean_pdf_text(c) for i, c in enumerate(cells) if i != pos_idx)
-+            if pos_is_new:
-+                if current:
-+                    logical_rows.append(current)
-+                current = cells[:]
-+                continue
-+
-+            if current is not None and has_payload:
-+                for i, val in enumerate(cells):
-+                    vv = clean_pdf_text(val)
-+                    if not vv:
-+                        continue
-+                    if current[i]:
-+                        current[i] = f"{current[i]}\n{vv}"
-+                    else:
-+                        current[i] = vv
-+            elif has_payload:
-+                current = cells[:]
-+
-+        if current:
-+            logical_rows.append(current)
-+
-+        if _DEBUG_PDF:
-+            warnings.append(f"[grid] page {page_idx+1}: physical_rows={len(row_cells)} logical_rows={len(logical_rows)}")
-+
-+        for cells in logical_rows:
-+            def cval(key: str) -> str:
-+                idx = col_map.get(key, -1)
-+                if idx < 0 or idx >= len(cells):
-+                    return ""
-+                return clean_pdf_text(cells[idx])
-+
-+            pos = _normalize_pos(cval("pos"))
-+            code = cval("code")
-+            if not code:
-+                continue
-+
-+            item: Dict[str, Any] = {
-+                "pos": "" if pos.lower() == "null" else pos,
-+                "internal_code": code,
-+                "rev": cval("rev"),
-+                "description": cval("desc"),
-+                "um": cval("um"),
-+                "qty": cval("qty") or None,
-+            }
-+
-+            for optional_key in ("type", "notes", "manufacturer", "manufacturer_code"):
-+                v = cval(optional_key)
-+                if v:
-+                    item[optional_key] = v
-+
-+            lines.append(item)
-+
-+    if not lines:
-+        warnings.append("[grid] Nessuna riga BOM estratta con grid-layout parser.")
-+    return lines, warnings
-+
-+
+     if not lines:
+         warnings.append("[grid] Nessuna riga BOM estratta con grid-layout parser.")
+     return lines, warnings
+
+
  def _extract_lines_from_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str, Any]], List[str]]:
      """
      Layout-based parser:
@@ -295,84 +291,130 @@ index 4e3f50388e8c6d77fb708b4e5e7377cee6afdb32..55e00cb8188358a924304a3ff7320ac9
      """
      warnings: List[str] = []
      lines: List[Dict[str, Any]] = []
- 
+
      for page_idx, page in enumerate(pdf.pages):
          words = page.extract_words() or []
          if not words:
              continue
- 
+
          hb = _find_table_header_band(words)
          if not hb:
              continue
- 
-         y0, y1 = hb
-         header_words = [w for w in words if float(w["top"]) >= y0 and float(w["top"]) <= y1]
-         cols = _build_x_columns_from_header(header_words, page.width)
- 
-@@ -969,53 +1156,63 @@ def parse_bom_pdf_raw(path: Path) -> dict:
+@@ -1141,78 +1171,105 @@ def parse_bom_pdf_raw(path: Path) -> dict:
+         for p in pdf.pages[:2]:
+             header_text.append(p.extract_text() or "")
+         text = "\n".join(header_text)
+
+         m = _RX_CODE_REV.search(text)
+         if m:
+             header["code"] = m.group(1).strip()
+             header["rev"] = m.group(2).strip()
+
+         mt = _RX_TITLE.search(text)
+         if mt:
+             header["title"] = mt.group(1).strip()
+
+         md = _RX_PRINT_DATE.search(text)
+         if md:
              d = md.group(1).strip()
              try:
                  dd, mm, yy = d.split("/")
                  header["date"] = f"{yy}-{mm}-{dd}"
              except Exception:
                  header["date"] = d
- 
+
          if not header["code"]:
              raise ValueError(f"BOM PDF senza header riconoscibile (code/rev): {path.name}")
- 
+
++        parser_used = "tables"
++        parser_counts: Dict[str, int] = {}
++
          # 1) Tables standard
          lines, found_body, table_debug = _extract_lines_from_tables(pdf, aggressive=False)
++        parser_counts["tables"] = len(lines)
++
          # 2) Tables aggressive fallback
          if not lines:
++            parser_used = "tables-aggressive"
              lines, found_body_aggr, table_debug_aggr = _extract_lines_from_tables(pdf, aggressive=True)
++            parser_counts["tables-aggressive"] = len(lines)
              found_body = found_body or found_body_aggr
              table_debug.extend(table_debug_aggr)
- 
- 
+
+-
          # 3) Text fallback (POS-based)
-         #    Nota: questo NON prenderà righe "Disegno" (perché non hanno POS).
+-        #    Nota: questo NON prenderà righe "Disegno" (perché non hanno POS).
          if not lines:
++            parser_used = "text"
              pages_text = [(p.extract_text() or "") for p in pdf.pages]
              lines = _parse_lines_from_text(pages_text)
- 
--        # 4) NEW: Layout fallback (words/x-y) when:
-+        # 4) NEW: grid-layout fallback, then legacy layout fallback when:
-         #    - no lines
-         #    - or strong misalignment detected
-         if _ENABLE_LAYOUT_FALLBACK and (not lines or _looks_like_misaligned_qty(lines)):
--            layout_lines, layout_warn = _extract_lines_from_layout(pdf)
--            if layout_lines:
-+            grid_lines, grid_warn = _extract_lines_from_grid_layout(pdf)
-+            if grid_lines:
-                 if lines:
--                    warnings.append("Fallback layout-based attivato (incoerenza tabelle: possibile misalignment Rev->Qty).")
-+                    warnings.append("Fallback grid-layout attivato (incoerenza tabelle: possibile misalignment Rev->Qty).")
+-
+-        # 4) NEW: grid-layout fallback, then legacy layout fallback when:
+-        #    - no lines
+-        #    - or strong misalignment detected
+-        if _ENABLE_LAYOUT_FALLBACK and (not lines or _looks_like_misaligned_qty(lines)):
++            parser_counts["text"] = len(lines)
++
++        # 4) Smart layout fallbacks
++        #    Attiva grid/layout quando:
++        #    - non ci sono righe
++        #    - oppure sospetto misalignment qty
++        #    - oppure il grid produce più righe con colonne finali valorizzate.
++        should_try_layout = _ENABLE_LAYOUT_FALLBACK and (not lines or _looks_like_misaligned_qty(lines) or found_body)
++        if should_try_layout:
+             grid_lines, grid_warn = _extract_lines_from_grid_layout(pdf)
+-            if grid_lines:
+-                if lines:
+-                    warnings.append("Fallback grid-layout attivato (incoerenza tabelle: possibile misalignment Rev->Qty).")
+-                else:
+-                    warnings.append("Fallback grid-layout attivato (nessuna riga da tables/text).")
++            parser_counts["grid-layout"] = len(grid_lines)
++
++            prefer_grid = False
++            if grid_lines and not lines:
++                prefer_grid = True
++            elif grid_lines and lines:
++                base_tail = _count_complete_tail_fields(lines)
++                grid_tail = _count_complete_tail_fields(grid_lines)
++                prefer_grid = (grid_tail > base_tail) or (grid_tail == base_tail and len(grid_lines) > len(lines))
++
++            if prefer_grid:
++                warnings.append("Fallback grid-layout attivato (output più completo su colonne finali / multilinea).")
+                 warnings.extend(grid_warn)
+                 lines = grid_lines
+-            else:
++                parser_used = "grid-layout"
++            elif not lines:
+                 warnings.extend(grid_warn)
+                 layout_lines, layout_warn = _extract_lines_from_layout(pdf)
++                parser_counts["layout-old"] = len(layout_lines)
+                 if layout_lines:
+-                    if lines:
+-                        warnings.append("Fallback layout-based attivato (grid fallback vuoto; possibile misalignment Rev->Qty).")
+-                    else:
+-                        warnings.append("Fallback layout-based attivato (grid fallback vuoto e nessuna riga da tables/text).")
++                    warnings.append("Fallback layout-based attivato (grid fallback vuoto).")
+                     warnings.extend(layout_warn)
+                     lines = layout_lines
++                    parser_used = "layout-old"
                  else:
--                    warnings.append("Fallback layout-based attivato (nessuna riga da tables/text).")
--                warnings.extend(layout_warn)
--                lines = layout_lines
-+                    warnings.append("Fallback grid-layout attivato (nessuna riga da tables/text).")
+                     warnings.extend(layout_warn)
++            else:
 +                warnings.extend(grid_warn)
-+                lines = grid_lines
-             else:
--                warnings.extend(layout_warn)
-+                warnings.extend(grid_warn)
-+                layout_lines, layout_warn = _extract_lines_from_layout(pdf)
-+                if layout_lines:
-+                    if lines:
-+                        warnings.append("Fallback layout-based attivato (grid fallback vuoto; possibile misalignment Rev->Qty).")
-+                    else:
-+                        warnings.append("Fallback layout-based attivato (grid fallback vuoto e nessuna riga da tables/text).")
-+                    warnings.extend(layout_warn)
-+                    lines = layout_lines
-+                else:
-+                    warnings.extend(layout_warn)
- 
+
          if _DEBUG_PDF and table_debug:
              warnings.extend(table_debug)
              for n in table_debug:
                  _LOG.info(n)
- 
+
++        if _DEBUG_PDF:
++            warnings.append(f"[debug] parser_used={parser_used}")
++            for name in ("tables", "tables-aggressive", "text", "grid-layout", "layout-old"):
++                if name in parser_counts:
++                    warnings.append(f"[debug] rows[{name}]={parser_counts[name]}")
++            warnings.append(f"[debug] rows_final={len(lines)}")
++            sample = lines[0] if lines else {}
++            warnings.append(f"[debug] sample_record={sample}")
  
          if not lines:
              if found_body:
