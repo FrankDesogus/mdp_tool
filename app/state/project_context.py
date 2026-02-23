@@ -422,6 +422,16 @@ class ProjectContext:
 
         root_code, root_rev = roots[0]
         explosions = getattr(result, "explosions", {}) or {}
+        if _DEBUG_DIAG:
+            available = sorted(f"{k[0]}:{k[1]}" for k in explosions.keys())
+            _LOG.debug(
+                "[ROOT_DEBUG] ui_selected_root=%s:%s explosion_lookup_key=%s:%s available=%s",
+                root_code,
+                root_rev,
+                root_code,
+                root_rev,
+                available,
+            )
         exp = explosions.get((root_code, root_rev))
         if exp is None:
             raise ValueError("AnalyzeFolderPdfResult has no explosion for the selected root.")

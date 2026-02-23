@@ -13,6 +13,11 @@ def test_extract_root_code_from_title_ignores_revision_tokens():
     assert extract_root_code_from_title('E0029472 01-03') == 'E0029472'
     assert extract_root_code_from_title('E0029472 01') == 'E0029472'
     assert extract_root_code_from_title('Descrizione assembly E0029472 rev 01') == 'E0029472'
+    assert extract_root_code_from_title('BOM E0029311 something') == 'E0029311'
+
+
+def test_extract_root_code_from_title_discards_malformed_hyphenated_code():
+    assert extract_root_code_from_title('E01813-31') is None
 
 
 def test_align_by_pos_multiline_only_for_text_columns():
