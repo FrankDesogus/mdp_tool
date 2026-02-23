@@ -9,7 +9,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 # ✅ PDF-only discovery
 from core.parsers.discovery_pdf import DiscoveryPdfResult, discover_folder_pdf
-from core.parsers.bom_pdf import parse_bom_pdf_raw
+from core.parsers.bom_pdf import parse_bom_pdf_raw, extract_root_code_from_title
 
 from core.domain.models import BomDocument
 from core.services.bom_normalizer import build_bom_document
@@ -75,6 +75,9 @@ def _canon_line_code(code: str, line_rev: str) -> str:
     """
     return canonicalize_pn(code or "", rev=_norm_rev(line_rev))
 
+
+def _norm_key(code: str) -> str:
+    return (code or "").strip().upper()
 
 def _fmt_qty(q: object) -> str:
     if q is None:
@@ -553,11 +556,21 @@ class AnalyzeFolderPdfUseCase:
                 for w in (raw.get("warnings") or []):
                     _add_issue("WARN", f"[BOM_PDF_PARSE_WARN] {p.name}: {w}", p, "BOM_PDF_PARSE")
 
+                header_title = str(header.get("title") or "")
+                header_rev = str(header.get("rev") or header.get("revision") or "")
+                root_code = str(header.get("root_code") or "").strip() or (extract_root_code_from_title(header_title) or "")
+                header_code_effective = root_code or str(header.get("code") or "")
+
+                _log(
+                    "DEBUG",
+                    f"[PDF_DEBUG] file={p.name} title_raw={header_title!r} root_code={root_code or '(none)'} rev_header={header_rev or '(none)'}",
+                )
+
                 bom = build_bom_document(
                     path=p,
-                    header_code=str(header.get("code") or ""),
-                    header_rev=str(header.get("rev") or header.get("revision") or ""),
-                    header_title=str(header.get("title") or ""),
+                    header_code=header_code_effective,
+                    header_rev=header_rev,
+                    header_title=header_title,
                     doc_date_iso=str(header.get("date") or header.get("doc_date_iso") or ""),
                     raw_lines=raw_lines,
                 )
@@ -612,6 +625,12 @@ class AnalyzeFolderPdfUseCase:
             header_nodes=header_nodes,
         )
 
+        if roots:
+            candidates = ", ".join(f"{c}:{r or '-'}" for c, r in roots)
+            _log("DEBUG", f"[ROOT_DEBUG] root_candidates=[{candidates}]")
+        else:
+            _log("DEBUG", "[ROOT_DEBUG] root_candidates=[]")
+
         if not roots:
             _add_issue(
                 "ERROR",
@@ -651,6 +670,13 @@ class AnalyzeFolderPdfUseCase:
 
         root_code, root_rev = roots[0]
         result.roots = [(root_code, root_rev)]
+        _log("DEBUG", f"[ROOT_DEBUG] root_selected={root_code} rev={root_rev or '(auto)'}")
+        rows_for_root = sum(
+            len(getattr(b, "lines", []) or [])
+            for b in bom_docs
+            if _norm_key(getattr(getattr(b, "header", None), "code", "")) == _norm_key(root_code)
+        )
+        _log("DEBUG", f"[ROOT_DEBUG] bom_rows_for_selected_root={rows_for_root}")
         _add_issue(
             "INFO",
             f"[ROOT_INFERENCE] Root unica: {root_code} REV {root_rev or '(auto)'}",
@@ -680,6 +706,9 @@ class AnalyzeFolderPdfUseCase:
             policy=policy,
         )
         result.explosions[(root_code, root_rev)] = exp
+        if (root_code, root_rev) not in result.explosions:
+            available = ", ".join(f"{k[0]}:{k[1]}" for k in sorted(result.explosions.keys()))
+            _log("DEBUG", f"[ROOT_DEBUG] selected_root_missing_from_explosions selected={root_code}:{root_rev} available=[{available}]")
 
         safe_root = f"{root_code}_REV_{(root_rev or 'AUTO')}".replace(" ", "_").replace("/", "_")
         tree_txt = diag_dir / f"bom_explosion_tree__{safe_root}.txt"
