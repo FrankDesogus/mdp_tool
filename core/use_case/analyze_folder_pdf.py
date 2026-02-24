@@ -18,7 +18,7 @@ from core.services.exploder_pdf import ExplodePolicy, explode_boms_pdf
 from core.services.part_master import build_part_master, lookup_part_info
 
 # ✅ PN canonicalization
-from core.services.pn_canonical import canonicalize_pn, canonicalize_rev
+from core.services.pn_canonical import canonicalize_part_number, canonicalize_rev
 
 _DEBUG_PDF = os.getenv("BOM_PDF_DEBUG", "0").strip() in {"1", "true", "True"}
 
@@ -61,6 +61,10 @@ def _norm_rev(rev: str) -> str:
     return canonicalize_rev(rev or "")
 
 
+def _canon_code(code: str, suffix: str) -> str:
+    return canonicalize_part_number(code or "", suffix=_norm_rev(suffix))
+
+
 def _canon_header_code(code: str, rev: str) -> str:
     """
     Canonicalizza PN header usando REV se disponibile.
@@ -69,14 +73,14 @@ def _canon_header_code(code: str, rev: str) -> str:
       - code='E022410301',  rev='01'
       - code='E0224103',    rev=''
     """
-    return canonicalize_pn(code or "", rev=_norm_rev(rev))
+    return _canon_code(code, rev)
 
 
 def _canon_line_code(code: str, line_rev: str) -> str:
     """
     Canonicalizza PN di riga usando line.rev (se presente).
     """
-    return canonicalize_pn(code or "", rev=_norm_rev(line_rev))
+    return _canon_code(code, line_rev)
 
 
 def _norm_key(code: str) -> str:

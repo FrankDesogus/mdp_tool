@@ -4,10 +4,12 @@ import types
 sys.modules.setdefault("pdfplumber", types.SimpleNamespace())
 
 from core.use_case.analyze_folder_pdf import (
+    _canon_header_code,
     _select_canonical_root_code,
     _select_header_code_effective,
     build_base_to_full_alias_from_headers,
 )
+from core.services.pn_canonical import canonicalize_part_number
 
 
 def test_select_canonical_root_code_prefers_root_code_and_has_no_suffix():
@@ -37,3 +39,16 @@ def test_build_base_to_full_alias_from_headers_only_uses_dash_suffix_format():
     alias = build_base_to_full_alias_from_headers({"E0181296", "E0254438-01", "E0254438"})
     assert "E01812" not in alias
     assert alias.get("E0254438") == "E0254438-01"
+
+
+def test_header_effective_matches_graph_parent_key():
+    header = {"code": "E0029472 01", "rev": "03", "root_code": "E0029472", "title": ""}
+    effective = _select_header_code_effective(header)
+    graph_key = _canon_header_code("E0029472 01", "03")
+    assert effective == graph_key
+
+
+def test_child_matching_header_canonicalization():
+    header = "E0029473 01"
+    child = "E002947301"
+    assert canonicalize_part_number(child) == canonicalize_part_number(header)
