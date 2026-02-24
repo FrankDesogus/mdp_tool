@@ -113,6 +113,20 @@ def _select_canonical_root_code(header: dict) -> str:
     return extract_root_code_from_title(code) or ""
 
 
+def _select_header_code_effective(header: dict) -> str:
+    """
+    Header code da usare per il nodo BOM: preserva il codice header completo.
+
+    Nota:
+    - root_code serve per inferenza root, NON per sostituire sempre header.code.
+    - se header.code manca, fallback a root_code per non perdere completamente il nodo.
+    """
+    header_code_raw = str(header.get("code") or "").strip()
+    if header_code_raw:
+        return header_code_raw
+    return _select_canonical_root_code(header)
+
+
 def build_bom_graph(
     boms: Iterable[BomDocument],
 ) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]], Dict[str, Set[str]], Set[str], Dict[str, str]]:
@@ -177,15 +191,20 @@ def build_base_to_full_alias_from_headers(header_nodes: Set[str]) -> Dict[str, s
     """
     Costruisce una mappa base->full usando SOLO gli header.
     Regola conservativa:
-      - se header termina con 2 cifre (es: ...01), base = header[:-2]
+      - alias solo per forme esplicitamente suffissate con "-NN" (es: E0254438-01 -> E0254438)
       - mapping valido SOLO se quel base mappa a UN SOLO header full
+
+    Evita falsi alias su codici che terminano naturalmente con 2 cifre (es: E0181296).
     """
     buckets: Dict[str, Set[str]] = {}
     for full in header_nodes:
-        if len(full) >= 2 and full[-2:].isdigit():
-            base = full[:-2]
-            if base:
-                buckets.setdefault(base, set()).add(full)
+        if len(full) < 4:
+            continue
+        if full[-3] != "-" or not full[-2:].isdigit():
+            continue
+        base = full[:-3]
+        if base:
+            buckets.setdefault(base, set()).add(full)
 
     alias: Dict[str, str] = {}
     for base, fulls in buckets.items():
@@ -583,7 +602,7 @@ class AnalyzeFolderPdfUseCase:
                 header_code_raw = str(header.get("code") or "")
                 header_rev = str(header.get("rev") or header.get("revision") or "")
                 root_code = _select_canonical_root_code(header)
-                header_code_effective = root_code or header_code_raw
+                header_code_effective = _select_header_code_effective(header)
 
                 if _DEBUG_PDF:
                     _log(
