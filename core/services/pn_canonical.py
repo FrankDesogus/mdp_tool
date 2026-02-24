@@ -4,7 +4,8 @@ import re
 from typing import Optional
 
 _SEP_RE = re.compile(r"[\s\-_\/\.]+")
-_SUFFIX_2DIG_RE = re.compile(r"^([A-Z]{1,3}\d{4,})\s*(\d{2})$")  # E0216160 01, C0020628 03, ecc.
+_SUFFIX_2DIG_WITH_SEP_RE = re.compile(r"^([A-Z]{1,3}\d{4,})[\s\-_\/\.]+(\d{2})$")
+_SUFFIX_2DIG_COMPACT_RE = re.compile(r"^([A-Z]{1,3}\d{4,})(\d{2})$")
 
 def canonicalize_rev(rev: str) -> str:
     return (rev or "").strip().upper()
@@ -25,8 +26,17 @@ def canonicalize_pn(code: str, *, rev: Optional[str] = None) -> str:
     # compatta whitespace multipli ma non perdere il confine
     c = re.sub(r"\s+", " ", c_raw).strip()
 
-    m = _SUFFIX_2DIG_RE.match(c)
+    # caso esplicito con separatore: "E0216160 01" -> "E0216160-01"
+    m = _SUFFIX_2DIG_WITH_SEP_RE.match(c)
     if m:
+        base, suf = m.group(1), m.group(2)
+        return f"{base}-{suf}"
+
+    # caso compatto (senza separatore) consentito SOLO se la rev passata coincide.
+    # evita falsi positivi tipo "E0029472" -> "E00294-72".
+    r = canonicalize_rev(rev or "")
+    m = _SUFFIX_2DIG_COMPACT_RE.match(c)
+    if m and r and m.group(2) == r:
         base, suf = m.group(1), m.group(2)
         return f"{base}-{suf}"
 
