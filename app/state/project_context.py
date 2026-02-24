@@ -29,6 +29,8 @@ except Exception:  # pragma: no cover
 
 _LOG = logging.getLogger(__name__)
 _DEBUG_DIAG = os.getenv("MDP_DEBUG_DIAGNOSTICS", "0").strip() in {"1", "true", "True"}
+_WU_DEBUG_ENV = "BOM_PDF_WU_DEBUG"
+_WU_DEBUG_TARGET = "166104001"
 
 
 def _find_pbs_root_row(pbs: Any) -> Tuple[int, Any]:
@@ -654,8 +656,20 @@ class ProjectContext:
                 parents_by_child_dd[child].add(parent)
                 occurrences_by_code_dd[child].append(e)
 
+        parents_by_child = {k: set(v) for k, v in parents_by_child_dd.items()}
+        occurrences_by_code = dict(occurrences_by_code_dd)
+        if (os.getenv(_WU_DEBUG_ENV, "").strip() == "1"):
+            for child_key in sorted(k for k in parents_by_child.keys() if _WU_DEBUG_TARGET in (k or "")):
+                parents_list = sorted(parents_by_child.get(child_key, set()))
+                _LOG.info(
+                    "[WU_DEBUG][where-used-index] child_key=%s parents_list=%s count=%s",
+                    child_key,
+                    parents_list,
+                    len(parents_list),
+                )
+
         return (
             dict(children_by_parent_dd),
-            {k: set(v) for k, v in parents_by_child_dd.items()},
-            dict(occurrences_by_code_dd),
+            parents_by_child,
+            occurrences_by_code,
         )
