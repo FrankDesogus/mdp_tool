@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -303,6 +304,100 @@ def infer_single_root_from_graph(
     return [(root_code, "")], debug
 
 
+def _extract_folder_hint(folder: Path) -> Optional[Tuple[str, str]]:
+    """
+    Estrae hint (base, rev) dal nome cartella.
+    Esempio: "E0181296 01-06" -> ("E0181296", "06")
+    """
+    text = (folder.name or "").upper()
+    m = re.search(r"(E\d{7,8})\s*0?1\s*[-_ ]\s*(\d{1,2})", text)
+    if not m:
+        return None
+    base = canonicalize_part_number(m.group(1))
+    rev = _norm_rev(m.group(2))
+    return (base, rev)
+
+
+def _reachable_header_count(
+    root_code: str,
+    *,
+    children_of: Dict[str, Set[str]],
+    header_nodes: Set[str],
+) -> int:
+    seen: Set[str] = set()
+    stack = [root_code]
+
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        for child in children_of.get(node, set()) or set():
+            if child not in seen:
+                stack.append(child)
+
+    return len(seen & header_nodes)
+
+
+def rank_roots(
+    *,
+    roots: List[Tuple[str, str]],
+    folder_hint: Optional[Tuple[str, str]],
+    children_of: Dict[str, Set[str]],
+    header_nodes: Set[str],
+) -> Tuple[Tuple[str, str], List[Dict[str, object]]]:
+    """
+    Ranking roots:
+      1) folder match (base+rev) con priorità altissima
+      2) reachable_count su header_nodes
+      3) outdegree
+      4) code lessicografico (stabilità)
+    """
+    rows: List[Dict[str, object]] = []
+
+    for code, rev in roots:
+        root_key = _norm_key(code)
+        effective_rev = _norm_rev(rev)
+        folder_match = 0
+        if folder_hint:
+            hint_code, hint_rev = folder_hint
+            if _norm_key(hint_code) == root_key and _norm_rev(hint_rev) == effective_rev:
+                folder_match = 1
+
+        reachable_count = _reachable_header_count(code, children_of=children_of, header_nodes=header_nodes)
+        outdegree = len(children_of.get(code, set()) or set())
+        score = (1_000_000 if folder_match else 0) + (reachable_count * 1_000) + outdegree
+
+        reason = []
+        if folder_match:
+            reason.append("folder_hint_match")
+        reason.append(f"reachable={reachable_count}")
+        reason.append(f"outdegree={outdegree}")
+
+        rows.append(
+            {
+                "root_candidate": code,
+                "root_rev": rev,
+                "score": score,
+                "outdegree": outdegree,
+                "reachable_count": reachable_count,
+                "folder_match": folder_match,
+                "reason": ",".join(reason),
+            }
+        )
+
+    rows.sort(
+        key=lambda r: (
+            -int(r["folder_match"]),
+            -int(r["reachable_count"]),
+            -int(r["outdegree"]),
+            str(r["root_candidate"]),
+        )
+    )
+    best = rows[0]
+    return (str(best["root_candidate"]), str(best["root_rev"])), rows
+
+
 # -------------------------
 # Diagnostics writers (NEW/RESTORED)
 # -------------------------
@@ -379,6 +474,26 @@ def _write_graph_stats_csv(
         w.writerow(["pn", "is_header", "indegree", "outdegree"])
         w.writerows(rows)
     return len(rows)
+
+
+def _write_root_ranking_csv(*, ranking_rows: List[Dict[str, object]], out_path: Path) -> int:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["root_candidate", "root_rev", "score", "outdegree", "reachable_count", "folder_match", "reason"])
+        for row in ranking_rows:
+            w.writerow(
+                [
+                    row.get("root_candidate", ""),
+                    row.get("root_rev", ""),
+                    row.get("score", 0),
+                    row.get("outdegree", 0),
+                    row.get("reachable_count", 0),
+                    row.get("folder_match", 0),
+                    row.get("reason", ""),
+                ]
+            )
+    return len(ranking_rows)
 
 
 def _write_bom_explosion_tree_txt(explosion: object, out_path: Path, boms: Optional[list[object]] = None) -> int:
@@ -706,36 +821,42 @@ class AnalyzeFolderPdfUseCase:
             )
             _add_issue("INFO", f"[ROOT_DEBUG] {' | '.join(dbg)}", base_dir, "ROOT_DEBUG")
             return result
+        _write_root_candidates_csv(
+            roots=roots,
+            parents_of=parents_of,
+            header_revs=header_revs,
+            out_path=diag_dir / "root_candidates.csv",
+        )
+
+        folder_hint = _extract_folder_hint(base_dir)
+        selected_root, ranking_rows = rank_roots(
+            roots=roots,
+            folder_hint=folder_hint,
+            children_of=children_of,
+            header_nodes=header_nodes,
+        )
+        _write_root_ranking_csv(ranking_rows=ranking_rows, out_path=diag_dir / "root_ranking.csv")
+
+        root_code, root_rev = selected_root
+        result.roots = [(root_code, root_rev)]
 
         if len(roots) > 1:
-            # niente euristiche: segnaliamo e stop, MA scriviamo diagnostica
-            result.roots = roots
             _add_issue(
                 "WARN",
-                f"[ROOT_INFERENCE] Trovate {len(roots)} roots (atteso 1). Nessuna euristica applicata.",
+                f"[ROOT_INFERENCE] Trovate {len(roots)} roots. Selezionata migliore via ranking: {root_code} REV {root_rev or '(auto)'}.",
                 base_dir,
                 "ROOT_INFERENCE_MULTI",
             )
-            _add_issue("INFO", f"[ROOT_DEBUG] {' | '.join(dbg)}", base_dir, "ROOT_DEBUG")
-
-            _write_root_candidates_csv(
-                roots=roots,
-                parents_of=parents_of,
-                header_revs=header_revs,
-                out_path=diag_dir / "root_candidates.csv",
-            )
-
+        else:
             _add_issue(
                 "INFO",
-                f"[DIAGNOSTICS] Creati: {(diag_dir / 'graph_stats.csv').name}, {(diag_dir / 'root_candidates.csv').name}",
-                diag_dir,
-                "DIAGNOSTICS",
+                f"[ROOT_INFERENCE] Root unica: {root_code} REV {root_rev or '(auto)'}",
+                base_dir,
+                "ROOT_INFERENCE_OK",
             )
-            _prog(1, 1, "Root multiple: analisi fermata (vedi diagnostica)")
-            return result
 
-        root_code, root_rev = roots[0]
-        result.roots = [(root_code, root_rev)]
+        top_reason = ranking_rows[0].get("reason", "") if ranking_rows else ""
+        _add_issue("INFO", f"[ROOT_DEBUG] {' | '.join(dbg)} | selected_reason={top_reason}", base_dir, "ROOT_DEBUG")
         if _DEBUG_PDF:
             _log("DEBUG", f"[ROOT_DEBUG] root_selected={root_code} rev={root_rev or '(auto)'}")
         rows_for_root = sum(
@@ -747,9 +868,9 @@ class AnalyzeFolderPdfUseCase:
             _log("DEBUG", f"[ROOT_DEBUG] bom_rows_for_selected_root={rows_for_root}")
         _add_issue(
             "INFO",
-            f"[ROOT_INFERENCE] Root unica: {root_code} REV {root_rev or '(auto)'}",
-            base_dir,
-            "ROOT_INFERENCE_OK",
+            f"[DIAGNOSTICS] Creati: {(diag_dir / 'graph_stats.csv').name}, {(diag_dir / 'root_candidates.csv').name}, {(diag_dir / 'root_ranking.csv').name}",
+            diag_dir,
+            "DIAGNOSTICS",
         )
 
         # 4) Explode UNA sola volta (da root)
