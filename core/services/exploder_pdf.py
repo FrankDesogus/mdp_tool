@@ -18,12 +18,27 @@
 from __future__ import annotations
 
 import re
+import os
+import logging
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from core.domain.models import BomDocument, BomLineKind, PbsDocument
 from core.services.pn_canonical import canonicalize_pn, canonicalize_rev
+
+
+_LOG = logging.getLogger(__name__)
+_WU_DEBUG_ENV = "BOM_PDF_WU_DEBUG"
+_WU_DEBUG_TARGET = "166104001"
+
+
+def _wu_debug_enabled() -> bool:
+    return (os.getenv(_WU_DEBUG_ENV, "") or "").strip() == "1"
+
+
+def _wu_has_target(value: str) -> bool:
+    return _WU_DEBUG_TARGET in ((value or "").strip())
 
 
 # -------------------------
@@ -699,6 +714,15 @@ def explode_boms_pdf(
             return
         res.qty_by_code[code_n] = res.qty_by_code.get(code_n, Decimal("0")) + qty
         res.qty_by_code_rev[(code_n, rev_n)] = res.qty_by_code_rev.get((code_n, rev_n), Decimal("0")) + qty
+        if _wu_debug_enabled() and (_wu_has_target(code) or _wu_has_target(code_n)):
+            _LOG.info(
+                "[WU_DEBUG][flat-accumulate] pn_display=%s rev_display=%s key_usata_per_grouping=%s qty_accumulated=%s qty_accumulated_by_code_rev=%s",
+                code,
+                rev_n,
+                code_n,
+                res.qty_by_code.get(code_n),
+                res.qty_by_code_rev.get((code_n, rev_n)),
+            )
 
     def _track_uom(child_code: str, raw_uom: object) -> str:
         uom = _norm_uom("" if raw_uom is None else str(raw_uom))
@@ -748,6 +772,21 @@ def explode_boms_pdf(
             child_code = _canon_code(internal, rev=child_rev)
             if not child_code:
                 continue
+
+            if _wu_debug_enabled() and (
+                _wu_has_target(internal)
+                or _wu_has_target(child_code)
+                or _wu_has_target(pcode)
+            ):
+                _LOG.info(
+                    "[WU_DEBUG][explode-edge] parent_raw=%s child_raw=%s parent_key=%s child_key=%s child_rev=%s canonical_child_key=%s",
+                    getattr(parent_bom.header, "code", "") or "",
+                    internal,
+                    pcode,
+                    child_code,
+                    _norm_rev(child_rev),
+                    _canon_code(internal, rev=child_rev),
+                )
 
             _track_uom(child_code, getattr(line, "unit", "") or "")
 

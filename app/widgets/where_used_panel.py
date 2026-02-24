@@ -4,7 +4,14 @@ from __future__ import annotations
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QListWidget, QListWidgetItem
 from PySide6.QtCore import Qt
 
+import logging
+import os
+
 from app.state.project_context import ProjectContext
+
+_LOG = logging.getLogger(__name__)
+_WU_DEBUG_ENV = "BOM_PDF_WU_DEBUG"
+_WU_DEBUG_TARGET = "166104001"
 
 
 class WhereUsedPanel(QWidget):
@@ -38,6 +45,16 @@ class WhereUsedPanel(QWidget):
         if self._ctx is None or not code:
             self.clear()
             return
+
+        if (os.getenv(_WU_DEBUG_ENV, "").strip() == "1") and (_WU_DEBUG_TARGET in code):
+            sample_keys = sorted(k for k in self._ctx.parents_by_child.keys() if _WU_DEBUG_TARGET in (k or ""))[:10]
+            _LOG.info(
+                "[WU_DEBUG][where-used-lookup] selected_display_pn=%s selected_rev=%s normalized_lookup_key=%s sample_keys_from_index_containing_166104001=%s",
+                code,
+                "",
+                (code or "").strip(),
+                sample_keys,
+            )
 
         self._title.setText(f"Where-used — {code}")
 

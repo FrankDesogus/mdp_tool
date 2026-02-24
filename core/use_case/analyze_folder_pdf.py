@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -22,6 +23,10 @@ from core.services.part_master import build_part_master, lookup_part_info
 from core.services.pn_canonical import canonicalize_part_number, canonicalize_rev
 
 _DEBUG_PDF = os.getenv("BOM_PDF_DEBUG", "0").strip() in {"1", "true", "True"}
+
+_LOG = logging.getLogger(__name__)
+_WU_DEBUG_ENV = "BOM_PDF_WU_DEBUG"
+_WU_DEBUG_TARGET = "166104001"
 
 
 # -------------------------
@@ -554,6 +559,21 @@ def _write_bom_flat_qty_csv(explosion: object, out_path: Path) -> int:
 
     rows = [(pn, _fmt_qty(qty)) for pn, qty in qty_map.items()]
     rows.sort(key=lambda x: x[0])
+
+    if (os.getenv(_WU_DEBUG_ENV, "").strip() == "1"):
+        qty_by_code_rev = getattr(explosion, "qty_by_code_rev", {}) or {}
+        for pn, qty in rows:
+            if _WU_DEBUG_TARGET not in pn:
+                continue
+            revs = [rev for (code, rev) in qty_by_code_rev.keys() if code == pn]
+            rev_display = ",".join(sorted({(r or "").strip() for r in revs}))
+            _LOG.info(
+                "[WU_DEBUG][flat-csv-row] pn_display=%s rev_display=%s key_usata_per_grouping=%s qty_accumulated=%s",
+                pn,
+                rev_display,
+                pn,
+                qty,
+            )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", newline="", encoding="utf-8") as f:
