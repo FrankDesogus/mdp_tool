@@ -115,16 +115,18 @@ def _select_canonical_root_code(header: dict) -> str:
 
 def _select_header_code_effective(header: dict) -> str:
     """
-    Header code da usare per il nodo BOM: preserva il codice header completo.
+    Header code da usare per il nodo BOM: usa la stessa canonicalizzazione
+    impiegata nella costruzione del grafo.
 
     Nota:
     - root_code serve per inferenza root, NON per sostituire sempre header.code.
     - se header.code manca, fallback a root_code per non perdere completamente il nodo.
     """
     header_code_raw = str(header.get("code") or "").strip()
+    header_rev = str(header.get("rev") or header.get("revision") or "")
     if header_code_raw:
-        return header_code_raw
-    return _select_canonical_root_code(header)
+        return _canon_header_code(header_code_raw, header_rev)
+    return _canon_header_code(_select_canonical_root_code(header), "")
 
 
 def build_bom_graph(

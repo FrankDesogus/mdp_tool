@@ -30,7 +30,7 @@ def test_select_canonical_root_code_discards_malformed_pattern():
 
 def test_select_header_code_effective_prefers_header_code_over_root_code():
     header = {"code": "E0181296 01", "root_code": "E0181296", "title": ""}
-    assert _select_header_code_effective(header) == "E0181296 01"
+    assert _select_header_code_effective(header) == "E0181296-01"
 
 
 def test_build_base_to_full_alias_from_headers_only_uses_dash_suffix_format():
