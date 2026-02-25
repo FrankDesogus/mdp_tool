@@ -11,6 +11,7 @@ from app.state.project_context import ProjectContext
 
 _LOG = logging.getLogger(__name__)
 _WU_DEBUG_ENV = "BOM_PDF_WU_DEBUG"
+_KEY_DEBUG_ENV = "BOM_KEY_DEBUG"
 _WU_DEBUG_TARGET = "166104001"
 
 
@@ -46,13 +47,14 @@ class WhereUsedPanel(QWidget):
             self.clear()
             return
 
-        if (os.getenv(_WU_DEBUG_ENV, "").strip() == "1") and (_WU_DEBUG_TARGET in code):
+        if ((os.getenv(_WU_DEBUG_ENV, "").strip() == "1") or (os.getenv(_KEY_DEBUG_ENV, "").strip() == "1")) and (_WU_DEBUG_TARGET in code):
             sample_keys = sorted(k for k in self._ctx.parents_by_child.keys() if _WU_DEBUG_TARGET in (k or ""))[:10]
+            lookup_key = (code or "").strip()
             _LOG.info(
-                "[WU_DEBUG][where-used-lookup] selected_display_pn=%s selected_rev=%s normalized_lookup_key=%s sample_keys_from_index_containing_166104001=%s",
+                "[KEY_DEBUG][where-used-lookup] selected_display_pn=%s where_used_lookup_key=%s index_contains_key=%s sample_keys_from_index_containing_166104001=%s",
                 code,
-                "",
-                (code or "").strip(),
+                lookup_key,
+                lookup_key in self._ctx.parents_by_child,
                 sample_keys,
             )
 

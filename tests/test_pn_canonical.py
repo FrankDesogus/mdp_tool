@@ -16,3 +16,7 @@ def test_canonicalize_pn_splits_compact_even_without_matching_rev():
 
 def test_canonicalize_part_number_aligns_compact_and_spaced_forms():
     assert canonicalize_part_number("E002947301") == canonicalize_part_number("E0029473 01")
+
+
+def test_canonicalize_part_number_does_not_duplicate_suffix_when_already_present():
+    assert canonicalize_part_number("166104001-04", suffix="04") == "166104001-04"
