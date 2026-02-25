@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import logging
+import os
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QTreeView, QTableView, QTabWidget,
@@ -21,6 +23,10 @@ from app.widgets.where_used_panel import WhereUsedPanel
 
 PBS_NODE_ID_ROLE = Qt.UserRole + 1
 PBS_CODE_ROLE = Qt.UserRole + 2
+
+_LOG = logging.getLogger(__name__)
+_KEY_DEBUG_ENV = "BOM_KEY_DEBUG"
+_KEY_DEBUG_TARGET = "166104001"
 
 
 class MainWindow(QMainWindow):
@@ -352,4 +358,12 @@ class MainWindow(QMainWindow):
         if not idx.isValid():
             return
         code = self._totals_model.code_at_row(idx.row())
+        if (os.getenv(_KEY_DEBUG_ENV, "").strip() == "1") and (_KEY_DEBUG_TARGET in (code or "")):
+            lookup_key = (code or "").strip()
+            _LOG.info(
+                "[KEY_DEBUG][totals-selection] totals_selection_key=%s where_used_lookup_key=%s index_contains_key=%s",
+                code,
+                lookup_key,
+                lookup_key in (self._ctx.parents_by_child if self._ctx else {}),
+            )
         self.where_used.show_code(code)

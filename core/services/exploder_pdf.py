@@ -30,11 +30,16 @@ from core.services.pn_canonical import canonicalize_pn, canonicalize_rev
 
 _LOG = logging.getLogger(__name__)
 _WU_DEBUG_ENV = "BOM_PDF_WU_DEBUG"
+_KEY_DEBUG_ENV = "BOM_KEY_DEBUG"
 _WU_DEBUG_TARGET = "166104001"
 
 
 def _wu_debug_enabled() -> bool:
     return (os.getenv(_WU_DEBUG_ENV, "") or "").strip() == "1"
+
+
+def _key_debug_enabled() -> bool:
+    return (os.getenv(_KEY_DEBUG_ENV, "") or "").strip() == "1"
 
 
 def _wu_has_target(value: str) -> bool:
@@ -708,15 +713,21 @@ def explode_boms_pdf(
     # Accumulators
     # -------------------------
     def _accumulate(code: str, rev: str, qty: Decimal) -> None:
-        code_n = _canon_code(code, rev=rev)
         rev_n = _norm_rev(rev)
+        code_n = (code or "").strip()
+        if not code_n:
+            return
+        if rev_n and code_n.endswith(f"-{rev_n}"):
+            pass
+        else:
+            code_n = _canon_code(code_n, rev=rev_n)
         if not code_n:
             return
         res.qty_by_code[code_n] = res.qty_by_code.get(code_n, Decimal("0")) + qty
         res.qty_by_code_rev[(code_n, rev_n)] = res.qty_by_code_rev.get((code_n, rev_n), Decimal("0")) + qty
-        if _wu_debug_enabled() and (_wu_has_target(code) or _wu_has_target(code_n)):
+        if (_wu_debug_enabled() or _key_debug_enabled()) and (_wu_has_target(code) or _wu_has_target(code_n)):
             _LOG.info(
-                "[WU_DEBUG][flat-accumulate] pn_display=%s rev_display=%s key_usata_per_grouping=%s qty_accumulated=%s qty_accumulated_by_code_rev=%s",
+                "[KEY_DEBUG][flat-accumulate] input_code_to_accumulate=%s input_rev=%s output_group_key=%s qty_accumulated=%s qty_accumulated_by_code_rev=%s",
                 code,
                 rev_n,
                 code_n,
@@ -773,19 +784,17 @@ def explode_boms_pdf(
             if not child_code:
                 continue
 
-            if _wu_debug_enabled() and (
+            if (_wu_debug_enabled() or _key_debug_enabled()) and (
                 _wu_has_target(internal)
                 or _wu_has_target(child_code)
                 or _wu_has_target(pcode)
             ):
                 _LOG.info(
-                    "[WU_DEBUG][explode-edge] parent_raw=%s child_raw=%s parent_key=%s child_key=%s child_rev=%s canonical_child_key=%s",
-                    getattr(parent_bom.header, "code", "") or "",
-                    internal,
+                    "[KEY_DEBUG][explode-edge] parent_key=%s child_internal_raw=%s child_rev=%s child_code_edge=%s",
                     pcode,
-                    child_code,
+                    internal,
                     _norm_rev(child_rev),
-                    _canon_code(internal, rev=child_rev),
+                    child_code,
                 )
 
             _track_uom(child_code, getattr(line, "unit", "") or "")
