@@ -2,7 +2,11 @@ import pytest
 
 pytest.importorskip('pdfplumber')
 
-from core.parsers.bom_pdf import _compare_parser_outputs, _find_table_header_band
+from core.parsers.bom_pdf import (
+    _compare_parser_outputs,
+    _compute_grid_selection_penalties,
+    _find_table_header_band,
+)
 
 
 def _w(text: str, x0: float, top: float):
@@ -29,3 +33,21 @@ def test_compare_parser_outputs_reports_overlap_metrics():
     assert out["codes_only_base"] == 1
     assert out["codes_only_candidate"] == 1
     assert out["code_overlap_ratio"] == 0.5
+
+
+def test_grid_selection_penalties_penalize_incomplete_low_overlap_row_loss():
+    base = [{"internal_code": f"E{i:04d}"} for i in range(10)]
+    cand = [{"internal_code": f"E{i:04d}"} for i in range(3)]
+    penalties = _compute_grid_selection_penalties(
+        base_lines=base,
+        grid_lines=cand,
+        grid_pages_total=3,
+        grid_pages_skipped=2,
+        grid_warn=["[grid] page 2: header tabella non trovato"],
+        output_delta=_compare_parser_outputs(base, cand),
+    )
+    assert penalties["parse_complete"] is False
+    assert penalties["page_coverage_ratio"] < 0.5
+    assert penalties["overlap_penalty"] > 0
+    assert penalties["row_loss_penalty"] > 0
+    assert penalties["total_penalty"] > 0
