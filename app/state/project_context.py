@@ -30,6 +30,7 @@ except Exception:  # pragma: no cover
 _LOG = logging.getLogger(__name__)
 _DEBUG_DIAG = os.getenv("MDP_DEBUG_DIAGNOSTICS", "0").strip() in {"1", "true", "True"}
 _WU_DEBUG_ENV = "BOM_PDF_WU_DEBUG"
+_KEY_DEBUG_ENV = "BOM_KEY_DEBUG"
 _WU_DEBUG_TARGET = "166104001"
 
 
@@ -658,11 +659,11 @@ class ProjectContext:
 
         parents_by_child = {k: set(v) for k, v in parents_by_child_dd.items()}
         occurrences_by_code = dict(occurrences_by_code_dd)
-        if (os.getenv(_WU_DEBUG_ENV, "").strip() == "1"):
+        if (os.getenv(_WU_DEBUG_ENV, "").strip() == "1") or (os.getenv(_KEY_DEBUG_ENV, "").strip() == "1"):
             for child_key in sorted(k for k in parents_by_child.keys() if _WU_DEBUG_TARGET in (k or "")):
                 parents_list = sorted(parents_by_child.get(child_key, set()))
                 _LOG.info(
-                    "[WU_DEBUG][where-used-index] child_key=%s parents_list=%s count=%s",
+                    "[KEY_DEBUG][where-used-index] child_key=%s parents_list=%s count=%s",
                     child_key,
                     parents_list,
                     len(parents_list),

@@ -734,6 +734,25 @@ class AnalyzeFolderPdfUseCase:
                 raw = parse_bom_pdf_raw(p)
                 header = raw.get("header", {}) or {}
                 raw_lines = raw.get("lines", []) or []
+                parse_meta = raw.get("meta", {}) or {}
+
+                parser_used = str(parse_meta.get("parser_used") or "")
+                parser_counts = parse_meta.get("parser_counts") or {}
+                found_body_table = bool(parse_meta.get("found_body_table", False))
+                _add_issue(
+                    "INFO",
+                    f"[BOM_PDF_PARSE_META] {p.name}: parser={parser_used or '(unknown)'} rows={len(raw_lines)} "
+                    f"found_body_table={found_body_table} counts={parser_counts}",
+                    p,
+                    "BOM_PDF_PARSE_META",
+                )
+                if found_body_table and not raw_lines:
+                    _add_issue(
+                        "WARN",
+                        f"[BOM_PDF_PARSE_INCOMPLETE] {p.name}: tabelle BOM individuate ma 0 righe estratte.",
+                        p,
+                        "BOM_PDF_PARSE_INCOMPLETE",
+                    )
 
                 # ⚠️ per ora NON spammiamo warnings: le salviamo ma non intasiamo
                 for w in (raw.get("warnings") or []):
