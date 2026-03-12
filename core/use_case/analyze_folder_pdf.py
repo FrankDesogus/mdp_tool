@@ -739,10 +739,13 @@ class AnalyzeFolderPdfUseCase:
                 parser_used = str(parse_meta.get("parser_used") or "")
                 parser_counts = parse_meta.get("parser_counts") or {}
                 found_body_table = bool(parse_meta.get("found_body_table", False))
+                parse_complete = bool(parse_meta.get("parse_complete", False))
+                severe_warnings_count = int(parse_meta.get("severe_warnings_count", 0) or 0)
                 _add_issue(
                     "INFO",
                     f"[BOM_PDF_PARSE_META] {p.name}: parser={parser_used or '(unknown)'} rows={len(raw_lines)} "
-                    f"found_body_table={found_body_table} counts={parser_counts}",
+                    f"found_body_table={found_body_table} parse_complete={parse_complete} "
+                    f"severe_warnings={severe_warnings_count} counts={parser_counts}",
                     p,
                     "BOM_PDF_PARSE_META",
                 )
@@ -752,6 +755,14 @@ class AnalyzeFolderPdfUseCase:
                         f"[BOM_PDF_PARSE_INCOMPLETE] {p.name}: tabelle BOM individuate ma 0 righe estratte.",
                         p,
                         "BOM_PDF_PARSE_INCOMPLETE",
+                    )
+                if not parse_complete:
+                    _add_issue(
+                        "WARN",
+                        f"[BOM_PDF_PARSE_PARTIAL] {p.name}: parse formalmente riuscito ma con segnali di incompletezza "
+                        f"(rows={len(raw_lines)}, severe_warnings={severe_warnings_count}, found_body_table={found_body_table}).",
+                        p,
+                        "BOM_PDF_PARSE_PARTIAL",
                     )
 
                 # ⚠️ per ora NON spammiamo warnings: le salviamo ma non intasiamo

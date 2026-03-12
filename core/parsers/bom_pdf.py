@@ -1329,10 +1329,20 @@ def parse_bom_pdf_raw(path: Path) -> dict:
             else:
                 warnings.append("Nessuna riga BOM estratta (nessuna tabella BOM riconosciuta e text fallback vuoto).")
 
+    severe_markers = (
+        "saltata (linee verticali insufficienti",
+        "header tabella non trovato",
+        "tabelle BOM trovate ma parsing fallito",
+        "nessuna tabella BOM riconosciuta",
+    )
+    severe_warnings = [w for w in warnings if any(m in w.lower() for m in severe_markers)]
+
     meta = {
         "parser_used": parser_used,
         "parser_counts": parser_counts,
         "found_body_table": found_body,
         "warnings_count": len(warnings),
+        "severe_warnings_count": len(severe_warnings),
+        "parse_complete": bool(lines) and not severe_warnings,
     }
     return {"header": header, "lines": lines, "warnings": warnings, "meta": meta}
