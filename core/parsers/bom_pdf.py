@@ -52,6 +52,16 @@ class PdfParserPolicy:
     parser_suspicious_penalty: float = float(os.getenv("BOM_PDF_PARSER_SUSPICIOUS_PENALTY", "2.0") or 2.0)
     parser_skipped_page_penalty: float = float(os.getenv("BOM_PDF_PARSER_SKIPPED_PAGE_PENALTY", "3.0") or 3.0)
     parser_min_score_gain_to_replace: float = float(os.getenv("BOM_PDF_PARSER_MIN_GAIN", "1.5") or 1.5)
+    parser_selection_coverage_penalty: float = float(os.getenv("BOM_PDF_PARSER_COVERAGE_PENALTY", "20.0") or 20.0)
+    parser_selection_parse_incomplete_penalty: float = float(os.getenv("BOM_PDF_PARSER_INCOMPLETE_PENALTY", "10.0") or 10.0)
+    parser_selection_overlap_penalty: float = float(os.getenv("BOM_PDF_PARSER_OVERLAP_PENALTY", "12.0") or 12.0)
+    parser_selection_min_overlap_ratio: float = float(os.getenv("BOM_PDF_PARSER_MIN_OVERLAP_RATIO", "0.55") or 0.55)
+    parser_selection_row_loss_penalty: float = float(os.getenv("BOM_PDF_PARSER_ROW_LOSS_PENALTY", "14.0") or 14.0)
+    parser_selection_row_loss_tolerance: float = float(os.getenv("BOM_PDF_PARSER_ROW_LOSS_TOL", "0.15") or 0.15)
+    parser_selection_severe_warning_penalty: float = float(os.getenv("BOM_PDF_PARSER_SEVERE_WARN_PENALTY", "3.0") or 3.0)
+    continuation_min_words: int = int(os.getenv("BOM_PDF_CONTINUATION_MIN_WORDS", "18") or 18)
+    continuation_min_code_like_tokens: int = int(os.getenv("BOM_PDF_CONTINUATION_MIN_CODE_TOKENS", "3") or 3)
+    continuation_min_pos_tokens: int = int(os.getenv("BOM_PDF_CONTINUATION_MIN_POS_TOKENS", "2") or 2)
     grid_table_y_min: float = float(os.getenv("BOM_PDF_GRID_TABLE_Y_MIN", "170") or 170)
     grid_table_y_max: float = float(os.getenv("BOM_PDF_GRID_TABLE_Y_MAX", "800") or 800)
     diagnostics_enabled: bool = os.getenv("BOM_PDF_DIAGNOSTICS", "1").strip() not in {"0", "false", "False"}
@@ -84,7 +94,17 @@ class GridPageDiag:
     page_skipped_reason: str = ""
     page_skipped_details: str = ""
     parse_quality_score: float = 0.0
+    page_quality_score: float = 0.0
     header_candidate_rows: int = 0
+    continuation_page_detected: bool = False
+    continuation_recovery_attempted: bool = False
+    continuation_recovery_success: bool = False
+    inherited_columns_used: bool = False
+    inherited_header_used: bool = False
+    vertical_lines_strategy: str = "detected"
+    header_recovery_strategy: str = "direct_header"
+    body_region_strategy: str = "header_band"
+    skip_reason_detailed: str = ""
 
 
 def _token_suspicion_flags(text: str) -> Set[str]:
@@ -1118,6 +1138,96 @@ def _count_complete_tail_fields(lines: List[Dict[str, Any]]) -> int:
 
 
 
+
+
+def _is_likely_continuation_page(
+    usable_words: List[Dict[str, Any]],
+    *,
+    prev_page_had_rows: bool,
+) -> Tuple[bool, Dict[str, int]]:
+    code_like = 0
+    pos_like = 0
+    for w in usable_words:
+        txt = clean_pdf_text(w.get("text"))
+        if not txt:
+            continue
+        if _looks_like_bom_code(txt):
+            code_like += 1
+        if re.fullmatch(r"\d{4}", txt):
+            pos_like += 1
+
+    metrics = {
+        "words": len(usable_words),
+        "code_like_tokens": code_like,
+        "pos_like_tokens": pos_like,
+    }
+    if not prev_page_had_rows:
+        return False, metrics
+
+    is_continuation = (
+        metrics["words"] >= _PDF_POLICY.continuation_min_words
+        and metrics["code_like_tokens"] >= _PDF_POLICY.continuation_min_code_like_tokens
+        and metrics["pos_like_tokens"] >= _PDF_POLICY.continuation_min_pos_tokens
+    )
+    return bool(is_continuation), metrics
+
+
+def _compute_grid_selection_penalties(
+    *,
+    base_lines: List[Dict[str, Any]],
+    grid_lines: List[Dict[str, Any]],
+    grid_pages_total: int,
+    grid_pages_skipped: int,
+    grid_warn: List[str],
+    output_delta: Dict[str, Any],
+) -> Dict[str, Any]:
+    page_coverage_ratio = 0.0
+    if grid_pages_total > 0:
+        page_coverage_ratio = (grid_pages_total - grid_pages_skipped) / float(grid_pages_total)
+
+    severe_markers = ("saltata", "non trovato", "insufficiente")
+    severe_warning_count = sum(1 for w in grid_warn if any(m in w.lower() for m in severe_markers))
+    parse_complete = bool(grid_lines) and grid_pages_skipped == 0 and severe_warning_count == 0
+
+    skipped_page_penalty = _PDF_POLICY.parser_skipped_page_penalty * float(grid_pages_skipped)
+    parse_complete_penalty = 0.0 if parse_complete else _PDF_POLICY.parser_selection_parse_incomplete_penalty
+    coverage_penalty = (1.0 - page_coverage_ratio) * _PDF_POLICY.parser_selection_coverage_penalty
+
+    overlap_ratio = float(output_delta.get("code_overlap_ratio", 0.0) or 0.0)
+    overlap_gap = max(0.0, _PDF_POLICY.parser_selection_min_overlap_ratio - overlap_ratio)
+    overlap_penalty = overlap_gap * _PDF_POLICY.parser_selection_overlap_penalty if base_lines else 0.0
+
+    row_loss_ratio = 0.0
+    if base_lines and len(grid_lines) < len(base_lines):
+        row_loss_ratio = (len(base_lines) - len(grid_lines)) / float(max(1, len(base_lines)))
+    row_loss_penalty = max(0.0, row_loss_ratio - _PDF_POLICY.parser_selection_row_loss_tolerance) * _PDF_POLICY.parser_selection_row_loss_penalty
+
+    severe_warnings_penalty = severe_warning_count * _PDF_POLICY.parser_selection_severe_warning_penalty
+
+    total_penalty = (
+        skipped_page_penalty
+        + parse_complete_penalty
+        + coverage_penalty
+        + overlap_penalty
+        + row_loss_penalty
+        + severe_warnings_penalty
+    )
+    return {
+        "page_coverage_ratio": page_coverage_ratio,
+        "skipped_page_penalty": skipped_page_penalty,
+        "parse_complete_penalty": parse_complete_penalty,
+        "coverage_penalty": coverage_penalty,
+        "overlap_penalty": overlap_penalty,
+        "row_loss_penalty": row_loss_penalty,
+        "severe_warnings_penalty": severe_warnings_penalty,
+        "overlap_ratio": overlap_ratio,
+        "row_loss_ratio": row_loss_ratio,
+        "severe_warning_count": severe_warning_count,
+        "parse_complete": parse_complete,
+        "total_penalty": total_penalty,
+    }
+
+
 def _build_grid_col_map(header_words: List[Dict[str, Any]], vlines: List[float]) -> Dict[str, int]:
     col_map: Dict[str, int] = {}
     for w in sorted(header_words, key=lambda ww: (float(ww.get("top", 0.0)), float(ww.get("x0", 0.0)))):
@@ -1145,21 +1255,19 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
     page_diags: List[Dict[str, Any]] = []
     suspicious_rows: List[Dict[str, Any]] = []
 
+    prev_vlines: List[float] = []
+    prev_col_map: Dict[str, int] = {}
+    prev_hy1: Optional[float] = None
+    prev_page_had_rows = False
+
     for page_idx, page in enumerate(pdf.pages):
         pd = GridPageDiag(page_number=page_idx + 1)
-        vlines = _extract_vertical_grid_lines(page, _GRID_TABLE_Y_MIN, _GRID_TABLE_Y_MAX)
+        raw_vlines = _extract_vertical_grid_lines(page, _GRID_TABLE_Y_MIN, _GRID_TABLE_Y_MAX)
         hlines = [ln for ln in (page.lines or []) if abs(float(ln.get("y0", 0.0)) - float(ln.get("y1", 0.0))) < 1.0]
-        pd.vertical_lines_count = len(vlines)
+        pd.vertical_lines_count = len(raw_vlines)
         pd.horizontal_lines_count = len(hlines)
         if _DEBUG_PDF:
-            warnings.append(f"[grid] page {page_idx+1}: vlines={len(vlines)}")
-
-        if len(vlines) < _PDF_POLICY.min_vertical_lines_soft:
-            pd.page_skipped_reason = f"low_vertical_lines:{len(vlines)}"
-            pd.page_skipped_details = f"min_soft={_PDF_POLICY.min_vertical_lines_soft} min_hard={_PDF_POLICY.min_vertical_lines}"
-            warnings.append(f"[grid] page {page_idx+1}: saltata (linee verticali insufficienti: {len(vlines)}).")
-            page_diags.append(pd.__dict__)
-            continue
+            warnings.append(f"[grid] page {page_idx+1}: vlines={len(raw_vlines)}")
 
         words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
         words = [
@@ -1171,8 +1279,10 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
         if not words:
             pd.page_skipped_reason = "no_words_in_table_band"
             pd.page_skipped_details = f"band=[{_GRID_TABLE_Y_MIN},{_GRID_TABLE_Y_MAX}]"
+            pd.skip_reason_detailed = pd.page_skipped_details
             warnings.append(f"[grid] page {page_idx+1}: nessuna word nella banda tabella.")
             page_diags.append(pd.__dict__)
+            prev_page_had_rows = False
             continue
 
         usable_words: List[Dict[str, Any]] = []
@@ -1192,34 +1302,86 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
             usable_words.append(w)
         total_words_used += len(usable_words)
 
+        continuation, continuation_metrics = _is_likely_continuation_page(
+            usable_words,
+            prev_page_had_rows=prev_page_had_rows,
+        )
+        pd.continuation_page_detected = continuation
+
+        vlines = raw_vlines
+        if len(raw_vlines) < _PDF_POLICY.min_vertical_lines_soft:
+            pd.vertical_lines_strategy = "insufficient"
+            if continuation and len(prev_vlines) >= _PDF_POLICY.min_vertical_lines_soft:
+                pd.continuation_recovery_attempted = True
+                pd.inherited_columns_used = True
+                pd.vertical_lines_strategy = "inherited_from_previous"
+                vlines = prev_vlines
+            else:
+                pd.page_skipped_reason = f"low_vertical_lines:{len(raw_vlines)}"
+                pd.page_skipped_details = f"min_soft={_PDF_POLICY.min_vertical_lines_soft} min_hard={_PDF_POLICY.min_vertical_lines}"
+                pd.skip_reason_detailed = f"vertical lines insufficient; continuation={continuation}; metrics={continuation_metrics}"
+                warnings.append(f"[grid] page {page_idx+1}: saltata (linee verticali insufficienti: {len(raw_vlines)}).")
+                page_diags.append(pd.__dict__)
+                prev_page_had_rows = False
+                continue
+
         hb, hb_diag = _find_table_header_band(usable_words, allow_fallback=True)
         pd.header_candidate_rows = int(hb_diag.get("rows_scanned", 0) or 0)
-        if not hb:
-            pd.page_skipped_reason = "missing_header"
-            pd.page_skipped_details = (
-                f"best_score={hb_diag.get('best_score', 0)} keys={hb_diag.get('best_keys', [])} "
-                f"mode={hb_diag.get('selected_mode', 'none')}"
-            )
-            warnings.append(
-                f"[grid] page {page_idx+1}: header tabella non trovato "
-                f"({pd.page_skipped_details})."
-            )
-            page_diags.append(pd.__dict__)
-            continue
-        pd.found_header = True
+        hy1: Optional[float] = None
+        col_map: Dict[str, int] = {}
 
-        hy0, hy1 = hb
-        header_words = [w for w in usable_words if hy0 <= float(w.get("top", 0.0)) <= hy1]
-        col_map = _build_grid_col_map(header_words, vlines)
-        pd.detected_columns_count = len(col_map)
+        if hb:
+            pd.found_header = True
+            hy0, hy1 = hb
+            header_words = [w for w in usable_words if hy0 <= float(w.get("top", 0.0)) <= hy1]
+            col_map = _build_grid_col_map(header_words, vlines)
+            pd.detected_columns_count = len(col_map)
+            pd.header_recovery_strategy = "direct_header"
+        else:
+            pd.header_recovery_strategy = "missing_header"
+            if continuation and prev_col_map and prev_hy1 is not None:
+                pd.continuation_recovery_attempted = True
+                pd.inherited_header_used = True
+                pd.inherited_columns_used = True
+                col_map = dict(prev_col_map)
+                hy1 = float(prev_hy1)
+                pd.detected_columns_count = len(col_map)
+                pd.header_recovery_strategy = "inherited_previous_header"
+            else:
+                pd.page_skipped_reason = "missing_header"
+                pd.page_skipped_details = (
+                    f"best_score={hb_diag.get('best_score', 0)} keys={hb_diag.get('best_keys', [])} "
+                    f"mode={hb_diag.get('selected_mode', 'none')}"
+                )
+                pd.skip_reason_detailed = f"header not found and no continuation recovery; metrics={continuation_metrics}"
+                warnings.append(
+                    f"[grid] page {page_idx+1}: header tabella non trovato "
+                    f"({pd.page_skipped_details})."
+                )
+                page_diags.append(pd.__dict__)
+                prev_page_had_rows = False
+                continue
+
         if not _validate_minimum_colmap(col_map):
-            pd.page_skipped_reason = "col_map_insufficient"
-            pd.page_skipped_details = f"col_map={col_map} vlines={len(vlines)}"
-            warnings.append(f"[grid] page {page_idx+1}: col_map insufficiente ({pd.page_skipped_details})")
-            page_diags.append(pd.__dict__)
-            continue
+            if continuation and prev_col_map:
+                pd.continuation_recovery_attempted = True
+                col_map = dict(prev_col_map)
+                pd.inherited_columns_used = True
+                pd.detected_columns_count = len(col_map)
+            else:
+                pd.page_skipped_reason = "col_map_insufficient"
+                pd.page_skipped_details = f"col_map={col_map} vlines={len(vlines)}"
+                pd.skip_reason_detailed = f"col_map insufficient without inheritance; continuation={continuation}"
+                warnings.append(f"[grid] page {page_idx+1}: col_map insufficiente ({pd.page_skipped_details})")
+                page_diags.append(pd.__dict__)
+                prev_page_had_rows = False
+                continue
 
         body_cutoff = float(page.height) - _PDF_POLICY.max_footer_distance_from_bottom
+        if hy1 is None:
+            hy1 = _GRID_TABLE_Y_MIN
+        if pd.inherited_header_used:
+            pd.body_region_strategy = "inherited_header_cutoff"
         body_words = [w for w in usable_words if float(w.get("top", 0.0)) > hy1 and float(w.get("top", 0.0)) < body_cutoff]
         pd.found_body_table = bool(body_words)
         physical_rows = _cluster_words_by_y(body_words, y_tol=_GRID_Y_TOL)
@@ -1234,6 +1396,8 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
                 x_mid = (float(w["x0"]) + float(w["x1"])) / 2.0
                 col_idx = _grid_column_index(vlines, x_mid)
                 if col_idx is None:
+                    continue
+                if col_idx >= len(cells):
                     continue
                 cells[col_idx] = f"{cells[col_idx]} {txt}".strip() if cells[col_idx] else txt
             if any(cells):
@@ -1285,7 +1449,11 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
         total_physical_rows += len(row_cells)
         total_logical_rows += len(logical_rows)
         pd.rows_detected = len(logical_rows)
+        if pd.continuation_recovery_attempted and pd.rows_detected > 0:
+            pd.continuation_recovery_success = True
         pd.parse_quality_score = float(len(logical_rows)) - float(pd.suspicious_tokens_count)
+        pd.page_quality_score = pd.parse_quality_score
+        pd.skip_reason_detailed = ""
         if _DEBUG_PDF:
             warnings.append(f"[grid] page {page_idx+1}: physical_rows={len(row_cells)} logical_rows={len(logical_rows)}")
 
@@ -1333,6 +1501,10 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
             lines.append(item)
 
         page_diags.append(pd.__dict__)
+        prev_vlines = vlines
+        prev_col_map = dict(col_map)
+        prev_hy1 = float(hy1)
+        prev_page_had_rows = bool(logical_rows)
 
     if _DEBUG_PDF:
         warnings.append(f"[grid] totals: physical_rows={total_physical_rows} logical_rows={total_logical_rows}")
@@ -1526,10 +1698,20 @@ def parse_bom_pdf_raw(path: Path) -> dict:
             tokens_discarded = int(grid_diag.get("tokens_discarded", 0) or 0)
 
             base_score = _compute_parser_quality(lines, warnings)
+            grid_pages_total = len(page_diags)
             grid_pages_skipped = sum(1 for p in page_diags if p.get("page_skipped_reason"))
-            grid_score = _compute_parser_quality(grid_lines, grid_warn, pages_skipped=grid_pages_skipped)
-            score_gain = grid_score - base_score
+            grid_score_raw = _compute_parser_quality(grid_lines, grid_warn, pages_skipped=0)
             output_delta = _compare_parser_outputs(lines, grid_lines)
+            grid_penalties = _compute_grid_selection_penalties(
+                base_lines=lines,
+                grid_lines=grid_lines,
+                grid_pages_total=grid_pages_total,
+                grid_pages_skipped=grid_pages_skipped,
+                grid_warn=grid_warn,
+                output_delta=output_delta,
+            )
+            grid_score_adjusted = grid_score_raw - float(grid_penalties.get("total_penalty", 0.0) or 0.0)
+            score_gain = grid_score_adjusted - base_score
 
             prefer_grid = False
             reason = "tables_preferred"
@@ -1538,14 +1720,23 @@ def parse_bom_pdf_raw(path: Path) -> dict:
                 reason = "grid_has_rows_tables_empty"
             elif grid_lines and lines:
                 strong_gain = score_gain >= _PDF_POLICY.parser_min_score_gain_to_replace
-                weak_overlap = float(output_delta.get("code_overlap_ratio", 0.0) or 0.0) < 0.35
-                prefer_grid = bool(strong_gain or (grid_score >= base_score and not weak_overlap))
-                if strong_gain:
-                    reason = "quality_score_strong_gain"
-                elif weak_overlap:
-                    reason = "tables_preferred_low_code_overlap"
+                overlap_ratio = float(grid_penalties.get("overlap_ratio", 0.0) or 0.0)
+                low_overlap = overlap_ratio < _PDF_POLICY.parser_selection_min_overlap_ratio
+                low_coverage = float(grid_penalties.get("page_coverage_ratio", 0.0) or 0.0) < 1.0
+                high_row_loss = float(grid_penalties.get("row_loss_ratio", 0.0) or 0.0) > _PDF_POLICY.parser_selection_row_loss_tolerance
+                parse_incomplete = not bool(grid_penalties.get("parse_complete", False))
+                blocked_for_completeness = low_coverage or (low_overlap and high_row_loss) or parse_incomplete
+                prefer_grid = bool(strong_gain and not blocked_for_completeness)
+                if prefer_grid:
+                    reason = "quality_score_adjusted_strong_gain"
+                elif parse_incomplete:
+                    reason = "tables_preferred_parse_incomplete"
+                elif low_coverage:
+                    reason = "tables_preferred_low_page_coverage"
+                elif low_overlap and high_row_loss:
+                    reason = "tables_preferred_low_overlap_row_loss"
                 else:
-                    reason = "quality_score_compare"
+                    reason = "tables_preferred_adjusted_score"
 
             parser_compare = {
                 "tables": {
@@ -1555,20 +1746,30 @@ def parse_bom_pdf_raw(path: Path) -> dict:
                 },
                 "grid": {
                     "rows": len(grid_lines),
-                    "quality_score": grid_score,
+                    "quality_score_raw": grid_score_raw,
+                    "quality_score": grid_score_adjusted,
                     "tail_fields": _count_complete_tail_fields(grid_lines),
                     "pages_skipped": grid_pages_skipped,
+                    "pages_total": grid_pages_total,
                 },
                 "score_gain": score_gain,
                 "min_gain_to_replace": _PDF_POLICY.parser_min_score_gain_to_replace,
                 "output_delta": output_delta,
+                "penalties": grid_penalties,
+                "selection_rationale": {
+                    "parse_complete": bool(grid_penalties.get("parse_complete", False)),
+                    "page_coverage_ratio": float(grid_penalties.get("page_coverage_ratio", 0.0) or 0.0),
+                    "overlap_ratio": float(grid_penalties.get("overlap_ratio", 0.0) or 0.0),
+                    "row_loss_ratio": float(grid_penalties.get("row_loss_ratio", 0.0) or 0.0),
+                    "adjusted_gain": score_gain,
+                },
                 "selected_reason": reason,
             }
 
             if prefer_grid:
                 warnings.append(
                     "Fallback grid-layout attivato "
-                    f"(reason={reason}; gain={score_gain:.2f}; overlap={output_delta.get('code_overlap_ratio', 0.0):.2f})."
+                    f"(reason={reason}; gain={score_gain:.2f}; overlap={output_delta.get('code_overlap_ratio', 0.0):.2f}; coverage={grid_penalties.get('page_coverage_ratio', 0.0):.2f})."
                 )
                 warnings.extend(grid_warn)
                 lines = grid_lines
@@ -1576,7 +1777,7 @@ def parse_bom_pdf_raw(path: Path) -> dict:
             elif grid_lines and lines:
                 warnings.append(
                     "Fallback grid-layout NON selezionato "
-                    f"(reason={reason}; gain={score_gain:.2f}; overlap={output_delta.get('code_overlap_ratio', 0.0):.2f})."
+                    f"(reason={reason}; gain={score_gain:.2f}; overlap={output_delta.get('code_overlap_ratio', 0.0):.2f}; coverage={grid_penalties.get('page_coverage_ratio', 0.0):.2f})."
                 )
                 warnings.extend(grid_warn)
             elif not lines:
@@ -1666,6 +1867,11 @@ def parse_bom_pdf_raw(path: Path) -> dict:
         "parser_quality_score": parser_quality_score,
         "grid_quality_score": (parser_compare.get("grid") or {}).get("quality_score") if parser_compare else None,
         "tables_quality_score": (parser_compare.get("tables") or {}).get("quality_score") if parser_compare else None,
+        "page_coverage_ratio": (parser_compare.get("penalties") or {}).get("page_coverage_ratio") if parser_compare else None,
+        "skipped_page_penalty": (parser_compare.get("penalties") or {}).get("skipped_page_penalty") if parser_compare else None,
+        "parse_complete_penalty": (parser_compare.get("penalties") or {}).get("parse_complete_penalty") if parser_compare else None,
+        "overlap_penalty": (parser_compare.get("penalties") or {}).get("overlap_penalty") if parser_compare else None,
+        "row_loss_penalty": (parser_compare.get("penalties") or {}).get("row_loss_penalty") if parser_compare else None,
         "parser_selection_reason": parser_compare.get("selected_reason", "") if parser_compare else "",
     }
 
