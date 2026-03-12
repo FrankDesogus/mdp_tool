@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import dataclass
+import json
 import logging
 import os
 import re
@@ -37,6 +39,112 @@ _ENABLE_LAYOUT_FALLBACK = os.getenv("BOM_PDF_LAYOUT_FALLBACK", "1").strip() not 
 _DEBUG_PDF = os.getenv("BOM_PDF_DEBUG", "0").strip() in {"1", "true", "True"}
 _LOG = logging.getLogger(__name__)
 
+
+@dataclass(frozen=True)
+class PdfParserPolicy:
+    min_vertical_lines: int = int(os.getenv("BOM_PDF_MIN_VERTICAL_LINES", "8") or 8)
+    min_vertical_lines_soft: int = int(os.getenv("BOM_PDF_MIN_VERTICAL_LINES_SOFT", "4") or 4)
+    max_footer_distance_from_bottom: float = float(os.getenv("BOM_PDF_MAX_FOOTER_DISTANCE", "55") or 55)
+    footer_filter_aggressiveness: float = float(os.getenv("BOM_PDF_FOOTER_FILTER_AGGR", "0.85") or 0.85)
+    header_fallback_strength: int = int(os.getenv("BOM_PDF_HEADER_FALLBACK_STRENGTH", "2") or 2)
+    multiline_merge_tolerance: int = int(os.getenv("BOM_PDF_MULTILINE_MERGE_TOL", "1") or 1)
+    parser_tail_weight: float = float(os.getenv("BOM_PDF_PARSER_TAIL_WEIGHT", "1.2") or 1.2)
+    parser_suspicious_penalty: float = float(os.getenv("BOM_PDF_PARSER_SUSPICIOUS_PENALTY", "2.0") or 2.0)
+    parser_skipped_page_penalty: float = float(os.getenv("BOM_PDF_PARSER_SKIPPED_PAGE_PENALTY", "3.0") or 3.0)
+    diagnostics_enabled: bool = os.getenv("BOM_PDF_DIAGNOSTICS", "1").strip() not in {"0", "false", "False"}
+
+
+_PDF_POLICY = PdfParserPolicy()
+
+
+_SUSPICIOUS_PATTERNS = {
+    "footer_like": re.compile(r"(THIS DOCUMENT CONTAINS|AUTORE|ORIGINATOR|STATO|STAGE|DATA RILASCIO|RILASCIO|RELEASE|PROPRIETA|CONFIDENZIALE)", re.IGNORECASE),
+    "signature_like": re.compile(r"(firma digitale|digital signature|documento emesso con sistema di firma digitale)", re.IGNORECASE),
+    "page_marker": re.compile(r"\b(Pagina|Page|Sheet)\s*\d+\b", re.IGNORECASE),
+}
+
+
+@dataclass
+class GridPageDiag:
+    page_number: int
+    parser_attempted: str = "grid-layout"
+    found_header: bool = False
+    found_body_table: bool = False
+    vertical_lines_count: int = 0
+    horizontal_lines_count: int = 0
+    detected_columns_count: int = 0
+    rows_detected: int = 0
+    suspicious_tokens_count: int = 0
+    footer_like_tokens_count: int = 0
+    signature_like_tokens_count: int = 0
+    page_marker_tokens_count: int = 0
+    page_skipped_reason: str = ""
+    parse_quality_score: float = 0.0
+
+
+def _token_suspicion_flags(text: str) -> Set[str]:
+    flags: Set[str] = set()
+    t = clean_pdf_text(text)
+    if not t:
+        return flags
+    for k, rx in _SUSPICIOUS_PATTERNS.items():
+        if rx.search(t):
+            flags.add(k)
+    return flags
+
+
+def _is_suspicious_word(word: Dict[str, Any], page_height: float) -> Tuple[bool, Set[str]]:
+    txt = clean_pdf_text(word.get("text"))
+    flags = _token_suspicion_flags(txt)
+    top = float(word.get("top", 0.0))
+    if (page_height - top) <= _PDF_POLICY.max_footer_distance_from_bottom:
+        if flags or _PDF_POLICY.footer_filter_aggressiveness >= 0.8:
+            flags.add("footer_band")
+    return bool(flags), flags
+
+
+def _looks_like_bom_code(token: str) -> bool:
+    t = clean_pdf_text(token)
+    return bool(re.fullmatch(r"[A-Z0-9][A-Z0-9._\-/]{4,}", t))
+
+
+def _row_suspicion_flags(item: Dict[str, Any]) -> Set[str]:
+    flags: Set[str] = set()
+    fields = " ".join(clean_pdf_text(item.get(k, "")) for k in ("description", "manufacturer", "manufacturer_code", "notes", "type"))
+    for f in _token_suspicion_flags(fields):
+        if f == "footer_like":
+            flags.add("footer_contamination")
+        elif f == "signature_like":
+            flags.add("signature_contamination")
+        elif f == "page_marker":
+            flags.add("page_marker_contamination")
+    if not _looks_like_bom_code(item.get("internal_code", "")):
+        flags.add("weak_code_pattern")
+    return flags
+
+
+def _compute_parser_quality(lines: List[Dict[str, Any]], warnings: List[str], *, pages_skipped: int = 0) -> float:
+    if not lines:
+        return -100.0
+    tail = _count_complete_tail_fields(lines)
+    suspicious_rows = sum(1 for ln in lines if _row_suspicion_flags(ln))
+    severe_markers = ("saltata", "non trovato", "insufficiente")
+    severe = sum(1 for w in warnings if any(m in w.lower() for m in severe_markers))
+    return (
+        float(len(lines))
+        + (_PDF_POLICY.parser_tail_weight * float(tail))
+        - (_PDF_POLICY.parser_suspicious_penalty * float(suspicious_rows + severe))
+        - (_PDF_POLICY.parser_skipped_page_penalty * float(pages_skipped))
+    )
+
+
+def _write_pdf_diagnostics(path: Path, payload: Dict[str, Any]) -> None:
+    if not _PDF_POLICY.diagnostics_enabled:
+        return
+    out_dir = Path("diagnostics") / "pdf_debug"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / f"{path.stem}.json"
+    out_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # ============================================================
 # Helpers
@@ -815,21 +923,20 @@ def _cluster_words_by_y(words: List[Dict[str, Any]], y_tol: float) -> List[List[
     return rows
 
 
-def _find_table_header_band(page_words: List[Dict[str, Any]]) -> Optional[Tuple[float, float]]:
+def _find_table_header_band(page_words: List[Dict[str, Any]], *, allow_fallback: bool = True) -> Optional[Tuple[float, float]]:
     """
     Trova la banda Y dell'header tabella BOM.
-    Strategia: raggruppa per righe, cerca riga con almeno 3 chiavi tra:
-      pos, code, rev, desc, qty
+    Strategia primaria: riga con pos+code e almeno 3 key tra (pos,code,rev,desc,qty).
+    Fallback (controllato da policy): accetta score=2 se contiene pos+code/qty su pagine dense.
     """
     if not page_words:
         return None
 
-    # stima tolleranza y in modo semplice
     heights = [float(w.get("height", 0.0)) for w in page_words if float(w.get("height", 0.0)) > 0]
     y_tol = 3.0 if not heights else max(2.0, min(4.5, (sum(heights) / len(heights)) * 0.6))
 
     rows = _cluster_words_by_y(page_words, y_tol=y_tol)
-    best_row = None
+    scored_rows: List[Tuple[int, List[Dict[str, Any]], Set[str]]] = []
 
     for rw in rows:
         keys = set()
@@ -837,18 +944,23 @@ def _find_table_header_band(page_words: List[Dict[str, Any]]) -> Optional[Tuple[
             k = _header_key_from_word(w.get("text", ""))
             if k:
                 keys.add(k)
-
         score = sum(k in keys for k in ("pos", "code", "rev", "desc", "qty"))
+        scored_rows.append((score, rw, keys))
         if ("pos" in keys and "code" in keys and score >= 3):
-            best_row = rw
-            break
+            y0 = min(float(w["top"]) for w in rw) - 3.0
+            y1 = max(float(w["bottom"]) for w in rw) + 18.0
+            return (y0, y1)
 
-    if not best_row:
-        return None
+    if allow_fallback and _PDF_POLICY.header_fallback_strength > 0:
+        for score, rw, keys in sorted(scored_rows, key=lambda t: t[0], reverse=True):
+            if score < 2:
+                continue
+            if ("pos" in keys and ("code" in keys or "qty" in keys)):
+                y0 = min(float(w["top"]) for w in rw) - 2.0
+                y1 = max(float(w["bottom"]) for w in rw) + (12.0 + (3.0 * _PDF_POLICY.header_fallback_strength))
+                return (y0, y1)
 
-    y0 = min(float(w["top"]) for w in best_row) - 3.0
-    y1 = max(float(w["bottom"]) for w in best_row) + 18.0  # include eventuale header multi-line
-    return (y0, y1)
+    return None
 
 
 def _build_x_columns_from_header(header_words: List[Dict[str, Any]], page_width: float) -> List[Tuple[str, float, float]]:
@@ -983,18 +1095,30 @@ def _build_grid_col_map(header_words: List[Dict[str, Any]], vlines: List[float])
     return col_map
 
 
-def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str, Any]], List[str]]:
+def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, Any]]:
     warnings: List[str] = []
     lines: List[Dict[str, Any]] = []
     total_physical_rows = 0
     total_logical_rows = 0
+    total_words = 0
+    total_words_used = 0
+    total_words_discarded = 0
+    page_diags: List[Dict[str, Any]] = []
+    suspicious_rows: List[Dict[str, Any]] = []
 
     for page_idx, page in enumerate(pdf.pages):
+        pd = GridPageDiag(page_number=page_idx + 1)
         vlines = _extract_vertical_grid_lines(page, _GRID_TABLE_Y_MIN, _GRID_TABLE_Y_MAX)
+        hlines = [ln for ln in (page.lines or []) if abs(float(ln.get("y0", 0.0)) - float(ln.get("y1", 0.0))) < 1.0]
+        pd.vertical_lines_count = len(vlines)
+        pd.horizontal_lines_count = len(hlines)
         if _DEBUG_PDF:
             warnings.append(f"[grid] page {page_idx+1}: vlines={len(vlines)}")
-        if len(vlines) < _GRID_MIN_VERTICAL_LINES:
+
+        if len(vlines) < _PDF_POLICY.min_vertical_lines_soft:
+            pd.page_skipped_reason = f"low_vertical_lines:{len(vlines)}"
             warnings.append(f"[grid] page {page_idx+1}: saltata (linee verticali insufficienti: {len(vlines)}).")
+            page_diags.append(pd.__dict__)
             continue
 
         words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
@@ -1003,22 +1127,51 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
             for w in words
             if _GRID_TABLE_Y_MIN <= float(w.get("top", 0.0)) <= _GRID_TABLE_Y_MAX and clean_pdf_text(w.get("text"))
         ]
+        total_words += len(words)
         if not words:
+            pd.page_skipped_reason = "no_words_in_table_band"
             warnings.append(f"[grid] page {page_idx+1}: nessuna word nella banda tabella.")
+            page_diags.append(pd.__dict__)
             continue
 
-        hb = _find_table_header_band(words)
+        usable_words: List[Dict[str, Any]] = []
+        for w in words:
+            is_susp, flags = _is_suspicious_word(w, float(page.height))
+            if is_susp:
+                pd.suspicious_tokens_count += 1
+                if "footer_like" in flags or "footer_band" in flags:
+                    pd.footer_like_tokens_count += 1
+                if "signature_like" in flags:
+                    pd.signature_like_tokens_count += 1
+                if "page_marker" in flags:
+                    pd.page_marker_tokens_count += 1
+                if ("footer_band" in flags and _PDF_POLICY.footer_filter_aggressiveness >= 0.8) or len(flags) >= 2:
+                    total_words_discarded += 1
+                    continue
+            usable_words.append(w)
+        total_words_used += len(usable_words)
+
+        hb = _find_table_header_band(usable_words, allow_fallback=True)
         if not hb:
+            pd.page_skipped_reason = "missing_header"
             warnings.append(f"[grid] page {page_idx+1}: header tabella non trovato.")
+            page_diags.append(pd.__dict__)
             continue
+        pd.found_header = True
+
         hy0, hy1 = hb
-        header_words = [w for w in words if hy0 <= float(w.get("top", 0.0)) <= hy1]
+        header_words = [w for w in usable_words if hy0 <= float(w.get("top", 0.0)) <= hy1]
         col_map = _build_grid_col_map(header_words, vlines)
+        pd.detected_columns_count = len(col_map)
         if not _validate_minimum_colmap(col_map):
+            pd.page_skipped_reason = "col_map_insufficient"
             warnings.append(f"[grid] page {page_idx+1}: col_map insufficiente={col_map}")
+            page_diags.append(pd.__dict__)
             continue
 
-        body_words = [w for w in words if float(w.get("top", 0.0)) > hy1]
+        body_cutoff = float(page.height) - _PDF_POLICY.max_footer_distance_from_bottom
+        body_words = [w for w in usable_words if float(w.get("top", 0.0)) > hy1 and float(w.get("top", 0.0)) < body_cutoff]
+        pd.found_body_table = bool(body_words)
         physical_rows = _cluster_words_by_y(body_words, y_tol=_GRID_Y_TOL)
 
         row_cells: List[List[str]] = []
@@ -1038,6 +1191,7 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
 
         logical_rows: List[List[str]] = []
         current: Optional[List[str]] = None
+        merge_streak = 0
         pos_idx = col_map.get("pos", -1)
         merge_allowed_idx = {
             col_map[k]
@@ -1051,12 +1205,14 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
 
             has_payload = any(clean_pdf_text(c) for i, c in enumerate(cells) if i != pos_idx)
             if pos_is_new:
+                merge_streak = 0
                 if current:
                     logical_rows.append(current)
                 current = cells[:]
                 continue
 
-            if current is not None and has_payload:
+            if current is not None and has_payload and merge_streak <= _PDF_POLICY.multiline_merge_tolerance:
+                merge_streak += 1
                 for i, val in enumerate(cells):
                     vv = clean_pdf_text(val)
                     if not vv:
@@ -1067,6 +1223,7 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
                         continue
                     if current[i]:
                         current[i] = f"{current[i]}\n{vv}"
+
                     else:
                         current[i] = vv
             elif has_payload:
@@ -1077,10 +1234,12 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
 
         total_physical_rows += len(row_cells)
         total_logical_rows += len(logical_rows)
+        pd.rows_detected = len(logical_rows)
+        pd.parse_quality_score = float(len(logical_rows)) - float(pd.suspicious_tokens_count)
         if _DEBUG_PDF:
             warnings.append(f"[grid] page {page_idx+1}: physical_rows={len(row_cells)} logical_rows={len(logical_rows)}")
 
-        for cells in logical_rows:
+        for row_idx, cells in enumerate(logical_rows):
             def cval(key: str) -> str:
                 idx = col_map.get(key, -1)
                 if idx < 0 or idx >= len(cells):
@@ -1106,15 +1265,40 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
                 if v:
                     item[optional_key] = v
 
+            row_flags = sorted(_row_suspicion_flags(item))
+            if row_flags:
+                suspicious_rows.append({
+                    "pdf_name": "",
+                    "page_number": page_idx + 1,
+                    "row_index": row_idx,
+                    "raw_text": " | ".join(c for c in cells if clean_pdf_text(c)),
+                    "extracted_code": item.get("internal_code", ""),
+                    "extracted_desc": item.get("description", ""),
+                    "extracted_mfr": item.get("manufacturer", ""),
+                    "extracted_mfr_code": item.get("manufacturer_code", ""),
+                    "suspicion_flags": row_flags,
+                    "reason": "; ".join(row_flags),
+                    "source_parser": "grid-layout",
+                })
             lines.append(item)
+
+        page_diags.append(pd.__dict__)
 
     if _DEBUG_PDF:
         warnings.append(f"[grid] totals: physical_rows={total_physical_rows} logical_rows={total_logical_rows}")
 
-
     if not lines:
         warnings.append("[grid] Nessuna riga BOM estratta con grid-layout parser.")
-    return lines, warnings
+    diag = {
+        "pages": page_diags,
+        "physical_rows": total_physical_rows,
+        "logical_rows": total_logical_rows,
+        "suspicious_rows": suspicious_rows,
+        "tokens_total": total_words,
+        "tokens_used": total_words_used,
+        "tokens_discarded": total_words_discarded,
+    }
+    return lines, warnings, diag
 
 
 def _extract_lines_from_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -1276,20 +1460,51 @@ def parse_bom_pdf_raw(path: Path) -> dict:
         #    - oppure sospetto misalignment qty
         #    - oppure il grid produce più righe con colonne finali valorizzate.
         should_try_layout = _ENABLE_LAYOUT_FALLBACK and (not lines or _looks_like_misaligned_qty(lines) or found_body)
+        parser_compare: Dict[str, Any] = {}
+        page_diags: List[Dict[str, Any]] = []
+        suspicious_rows: List[Dict[str, Any]] = []
+        tokens_total = 0
+        tokens_used = 0
+        tokens_discarded = 0
         if should_try_layout:
-            grid_lines, grid_warn = _extract_lines_from_grid_layout(pdf)
+            grid_lines, grid_warn, grid_diag = _extract_lines_from_grid_layout(pdf)
             parser_counts["grid-layout"] = len(grid_lines)
+            page_diags = grid_diag.get("pages", [])
+            suspicious_rows = grid_diag.get("suspicious_rows", [])
+            tokens_total = int(grid_diag.get("tokens_total", 0) or 0)
+            tokens_used = int(grid_diag.get("tokens_used", 0) or 0)
+            tokens_discarded = int(grid_diag.get("tokens_discarded", 0) or 0)
+
+            base_score = _compute_parser_quality(lines, warnings)
+            grid_pages_skipped = sum(1 for p in page_diags if p.get("page_skipped_reason"))
+            grid_score = _compute_parser_quality(grid_lines, grid_warn, pages_skipped=grid_pages_skipped)
 
             prefer_grid = False
+            reason = "tables_preferred"
             if grid_lines and not lines:
                 prefer_grid = True
+                reason = "grid_has_rows_tables_empty"
             elif grid_lines and lines:
-                base_tail = _count_complete_tail_fields(lines)
-                grid_tail = _count_complete_tail_fields(grid_lines)
-                prefer_grid = (grid_tail > base_tail) or (grid_tail == base_tail and len(grid_lines) > len(lines))
+                prefer_grid = grid_score >= base_score
+                reason = "quality_score_compare"
+
+            parser_compare = {
+                "tables": {
+                    "rows": len(lines),
+                    "quality_score": base_score,
+                    "tail_fields": _count_complete_tail_fields(lines),
+                },
+                "grid": {
+                    "rows": len(grid_lines),
+                    "quality_score": grid_score,
+                    "tail_fields": _count_complete_tail_fields(grid_lines),
+                    "pages_skipped": grid_pages_skipped,
+                },
+                "selected_reason": reason,
+            }
 
             if prefer_grid:
-                warnings.append("Fallback grid-layout attivato (output più completo su colonne finali / multilinea).")
+                warnings.append("Fallback grid-layout attivato (selezione guidata da quality score).")
                 warnings.extend(grid_warn)
                 lines = grid_lines
                 parser_used = "grid-layout"
@@ -1337,6 +1552,54 @@ def parse_bom_pdf_raw(path: Path) -> dict:
     )
     severe_warnings = [w for w in warnings if any(m in w.lower() for m in severe_markers)]
 
+    suspicious_footer_tokens_count = sum(int(p.get("footer_like_tokens_count", 0) or 0) for p in page_diags)
+    suspicious_signature_tokens_count = sum(int(p.get("signature_like_tokens_count", 0) or 0) for p in page_diags)
+    suspicious_page_marker_tokens_count = sum(int(p.get("page_marker_tokens_count", 0) or 0) for p in page_diags)
+    suspicious_tokens_count = sum(int(p.get("suspicious_tokens_count", 0) or 0) for p in page_diags)
+    pages_skipped = sum(1 for p in page_diags if p.get("page_skipped_reason"))
+    pages_parsed = (len(page_diags) - pages_skipped) if page_diags else (1 if lines else 0)
+
+    parser_quality_score = _compute_parser_quality(lines, warnings, pages_skipped=pages_skipped)
+    if parser_compare:
+        parser_compare["selected"] = parser_used
+
+    for sr in suspicious_rows:
+        sr["pdf_name"] = path.name
+
+    summary = {
+        "pdf_name": path.name,
+        "parser_selected": parser_used,
+        "pages_total": len(page_diags) if page_diags else 0,
+        "pages_parsed": pages_parsed,
+        "pages_skipped": pages_skipped,
+        "parse_complete": bool(lines) and not severe_warnings,
+        "severe_warnings": len(severe_warnings),
+        "body_table_found_pages": sum(1 for p in page_diags if p.get("found_body_table")),
+        "header_found_pages": sum(1 for p in page_diags if p.get("found_header")),
+        "suspicious_footer_tokens_count": suspicious_footer_tokens_count,
+        "suspicious_signature_tokens_count": suspicious_signature_tokens_count,
+        "suspicious_page_marker_tokens_count": suspicious_page_marker_tokens_count,
+        "tokens_total": tokens_total,
+        "tokens_used": tokens_used,
+        "tokens_discarded": tokens_discarded if tokens_discarded else suspicious_tokens_count,
+        "discarded_footer_like_tokens": suspicious_footer_tokens_count,
+        "rows_extracted": len(lines),
+        "rows_flagged_suspicious": len(suspicious_rows),
+        "parser_quality_score": parser_quality_score,
+        "grid_quality_score": (parser_compare.get("grid") or {}).get("quality_score") if parser_compare else None,
+        "tables_quality_score": (parser_compare.get("tables") or {}).get("quality_score") if parser_compare else None,
+        "parser_selection_reason": parser_compare.get("selected_reason", "") if parser_compare else "",
+    }
+
+    diag_payload = {
+        "summary": summary,
+        "pages": page_diags,
+        "suspicious_rows": suspicious_rows,
+        "parser_compare": parser_compare,
+        "policy": _PDF_POLICY.__dict__,
+    }
+    _write_pdf_diagnostics(path, diag_payload)
+
     meta = {
         "parser_used": parser_used,
         "parser_counts": parser_counts,
@@ -1344,5 +1607,10 @@ def parse_bom_pdf_raw(path: Path) -> dict:
         "warnings_count": len(warnings),
         "severe_warnings_count": len(severe_warnings),
         "parse_complete": bool(lines) and not severe_warnings,
+        "parser_quality_score": parser_quality_score,
+        "parser_compare": parser_compare,
+        "page_diagnostics": page_diags,
+        "suspicious_rows": suspicious_rows,
+        "pdf_parser_policy": _PDF_POLICY.__dict__,
     }
     return {"header": header, "lines": lines, "warnings": warnings, "meta": meta}

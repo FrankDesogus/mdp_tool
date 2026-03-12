@@ -180,6 +180,10 @@ class ExplodePolicy:
     warn_missing_qty: bool = False
     warn_non_positive_qty: bool = False
 
+    # Anti-noise policy for PDF BOM lines
+    explode_unknown: bool = False
+    explode_procedural_unknown: bool = False
+
 
 @dataclass(frozen=True)
 class ExplosionEdge:
@@ -765,6 +769,15 @@ def explode_boms_pdf(
 
             if (not policy.explode_documents) and line.kind in (BomLineKind.DOCUMENT_REF,):
                 continue
+
+            if line.kind == BomLineKind.UNKNOWN:
+                desc_u = (getattr(line, "description", "") or "").upper()
+                type_u = (getattr(line, "type", "") or "").upper()
+                procedural = any(k in desc_u for k in ("PROCEDURA", "PRESCRIZ", "ISTRUZ", "OPERATIV")) or any(k in type_u for k in ("DOC", "PROC", "PRESCR"))
+                if procedural and not policy.explode_procedural_unknown:
+                    continue
+                if (not procedural) and (not policy.explode_unknown):
+                    continue
 
             # child_rev resolution (PBS-first, then line.rev)
             child_rev = ""
