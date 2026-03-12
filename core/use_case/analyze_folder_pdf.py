@@ -967,7 +967,7 @@ class AnalyzeFolderPdfUseCase:
         for e in (getattr(exp, "errors", []) or [])[:40]:
             _add_issue("ERROR", f"[EXPLODE_ERR] {e}", diag_dir, "EXPLODE_ERR")
 
-        _prog(1, 1, "Explode completato")
+        _prog(1, 1, "Explode COMPLETATO")
         return result
 
 
