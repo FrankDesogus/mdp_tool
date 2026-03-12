@@ -116,6 +116,10 @@ class ExplodePolicy:
     recursive_fallback: bool = True
     recursive_pick_highest_rev: bool = True
 
+    # Anti-noise policy for BOM lines
+    explode_unknown: bool = False
+    explode_procedural_unknown: bool = False
+
 
 @dataclass(frozen=True)
 class ExplosionEdge:
@@ -739,6 +743,15 @@ def explode_boms(
             # filtra documentazione se richiesto
             if (not policy.explode_documents) and line.kind in (BomLineKind.DOCUMENT_REF,):
                 continue
+
+            if line.kind == BomLineKind.UNKNOWN:
+                desc_u = (getattr(line, "description", "") or "").upper()
+                type_u = (getattr(line, "type", "") or "").upper()
+                procedural = any(k in desc_u for k in ("PROCEDURA", "PRESCRIZ", "ISTRUZ", "OPERATIV")) or any(k in type_u for k in ("DOC", "PROC", "PRESCR"))
+                if procedural and not policy.explode_procedural_unknown:
+                    continue
+                if (not procedural) and (not policy.explode_unknown):
+                    continue
 
             child_code = _norm_code(line.internal_code)
             _track_uom(child_code, getattr(line, "unit", ""))
