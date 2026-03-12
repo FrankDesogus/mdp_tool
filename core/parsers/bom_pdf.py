@@ -1206,6 +1206,9 @@ def _extract_lines_from_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str, Any]
 def parse_bom_pdf_raw(path: Path) -> dict:
     header: Dict[str, str] = {"code": "", "rev": "", "title": "", "date": "", "root_code": ""}
     warnings: List[str] = []
+    parser_used = "tables"
+    parser_counts: Dict[str, int] = {}
+    found_body = False
 
     with pdfplumber.open(path) as pdf:
         # header: prova su 1-2 pagine (a volte l'header è spezzato)
@@ -1247,10 +1250,6 @@ def parse_bom_pdf_raw(path: Path) -> dict:
 
         if not header["code"]:
             raise ValueError(f"BOM PDF senza header riconoscibile (code/rev): {path.name}")
-
-        parser_used = "tables"
-        parser_counts: Dict[str, int] = {}
-
 
         # 1) Tables standard
         lines, found_body, table_debug = _extract_lines_from_tables(pdf, aggressive=False)
@@ -1330,4 +1329,10 @@ def parse_bom_pdf_raw(path: Path) -> dict:
             else:
                 warnings.append("Nessuna riga BOM estratta (nessuna tabella BOM riconosciuta e text fallback vuoto).")
 
-    return {"header": header, "lines": lines, "warnings": warnings}
+    meta = {
+        "parser_used": parser_used,
+        "parser_counts": parser_counts,
+        "found_body_table": found_body,
+        "warnings_count": len(warnings),
+    }
+    return {"header": header, "lines": lines, "warnings": warnings, "meta": meta}
