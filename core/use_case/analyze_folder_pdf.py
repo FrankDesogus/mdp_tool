@@ -741,13 +741,23 @@ class AnalyzeFolderPdfUseCase:
                 found_body_table = bool(parse_meta.get("found_body_table", False))
                 parse_complete = bool(parse_meta.get("parse_complete", False))
                 severe_warnings_count = int(parse_meta.get("severe_warnings_count", 0) or 0)
+                diagnostics_enabled = bool(parse_meta.get("diagnostics_enabled", False))
+                diagnostics_path = str(parse_meta.get("diagnostics_path") or "")
+                parser_quality_score = parse_meta.get("parser_quality_score")
+                partial_reasons = parse_meta.get("parse_partial_reasons") or []
                 _add_issue(
                     "INFO",
                     f"[BOM_PDF_PARSE_META] {p.name}: parser={parser_used or '(unknown)'} rows={len(raw_lines)} "
                     f"found_body_table={found_body_table} parse_complete={parse_complete} "
-                    f"severe_warnings={severe_warnings_count} counts={parser_counts}",
+                    f"severe_warnings={severe_warnings_count} quality={parser_quality_score} counts={parser_counts}",
                     p,
                     "BOM_PDF_PARSE_META",
+                )
+                _add_issue(
+                    "INFO",
+                    f"[BOM_PDF_DIAG] {p.name}: diagnostics_enabled={diagnostics_enabled} path={diagnostics_path or '(n/a)'}",
+                    p,
+                    "BOM_PDF_DIAG",
                 )
                 if found_body_table and not raw_lines:
                     _add_issue(
@@ -759,8 +769,9 @@ class AnalyzeFolderPdfUseCase:
                 if not parse_complete:
                     _add_issue(
                         "WARN",
-                        f"[BOM_PDF_PARSE_PARTIAL] {p.name}: parse formalmente riuscito ma con segnali di incompletezza "
-                        f"(rows={len(raw_lines)}, severe_warnings={severe_warnings_count}, found_body_table={found_body_table}).",
+                        f"[BOM_PDF_PARSE_PARTIAL] {p.name}: parse ancora problematico "
+                        f"(rows={len(raw_lines)}, severe_warnings={severe_warnings_count}, found_body_table={found_body_table}, "
+                        f"partial_reasons={partial_reasons}). Vedi diagnostica: {diagnostics_path or '(n/a)'}.",
                         p,
                         "BOM_PDF_PARSE_PARTIAL",
                     )
