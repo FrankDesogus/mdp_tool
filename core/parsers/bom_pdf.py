@@ -51,6 +51,9 @@ class PdfParserPolicy:
     parser_tail_weight: float = float(os.getenv("BOM_PDF_PARSER_TAIL_WEIGHT", "1.2") or 1.2)
     parser_suspicious_penalty: float = float(os.getenv("BOM_PDF_PARSER_SUSPICIOUS_PENALTY", "2.0") or 2.0)
     parser_skipped_page_penalty: float = float(os.getenv("BOM_PDF_PARSER_SKIPPED_PAGE_PENALTY", "3.0") or 3.0)
+    parser_min_score_gain_to_replace: float = float(os.getenv("BOM_PDF_PARSER_MIN_GAIN", "1.5") or 1.5)
+    grid_table_y_min: float = float(os.getenv("BOM_PDF_GRID_TABLE_Y_MIN", "170") or 170)
+    grid_table_y_max: float = float(os.getenv("BOM_PDF_GRID_TABLE_Y_MAX", "800") or 800)
     diagnostics_enabled: bool = os.getenv("BOM_PDF_DIAGNOSTICS", "1").strip() not in {"0", "false", "False"}
 
 
@@ -79,7 +82,9 @@ class GridPageDiag:
     signature_like_tokens_count: int = 0
     page_marker_tokens_count: int = 0
     page_skipped_reason: str = ""
+    page_skipped_details: str = ""
     parse_quality_score: float = 0.0
+    header_candidate_rows: int = 0
 
 
 def _token_suspicion_flags(text: str) -> Set[str]:
@@ -137,6 +142,22 @@ def _compute_parser_quality(lines: List[Dict[str, Any]], warnings: List[str], *,
         - (_PDF_POLICY.parser_skipped_page_penalty * float(pages_skipped))
     )
 
+
+def _compare_parser_outputs(base_lines: List[Dict[str, Any]], cand_lines: List[Dict[str, Any]]) -> Dict[str, Any]:
+    base_codes = {clean_pdf_text(x.get("internal_code", "")).upper() for x in base_lines if clean_pdf_text(x.get("internal_code"))}
+    cand_codes = {clean_pdf_text(x.get("internal_code", "")).upper() for x in cand_lines if clean_pdf_text(x.get("internal_code"))}
+    overlap = len(base_codes & cand_codes)
+    only_base = len(base_codes - cand_codes)
+    only_cand = len(cand_codes - base_codes)
+    overlap_ratio = (overlap / max(1, len(base_codes))) if base_codes else (1.0 if not cand_codes else 0.0)
+    return {
+        "base_unique_codes": len(base_codes),
+        "cand_unique_codes": len(cand_codes),
+        "code_overlap": overlap,
+        "code_overlap_ratio": overlap_ratio,
+        "codes_only_base": only_base,
+        "codes_only_candidate": only_cand,
+    }
 
 def _write_pdf_diagnostics(path: Path, payload: Dict[str, Any]) -> None:
     if not _PDF_POLICY.diagnostics_enabled:
@@ -923,19 +944,31 @@ def _cluster_words_by_y(words: List[Dict[str, Any]], y_tol: float) -> List[List[
     return rows
 
 
-def _find_table_header_band(page_words: List[Dict[str, Any]], *, allow_fallback: bool = True) -> Optional[Tuple[float, float]]:
+def _find_table_header_band(
+    page_words: List[Dict[str, Any]],
+    *,
+    allow_fallback: bool = True,
+) -> Tuple[Optional[Tuple[float, float]], Dict[str, Any]]:
     """
     Trova la banda Y dell'header tabella BOM.
     Strategia primaria: riga con pos+code e almeno 3 key tra (pos,code,rev,desc,qty).
     Fallback (controllato da policy): accetta score=2 se contiene pos+code/qty su pagine dense.
     """
+    diag: Dict[str, Any] = {
+        "rows_scanned": 0,
+        "best_score": 0,
+        "best_keys": [],
+        "selected_mode": "none",
+    }
     if not page_words:
-        return None
+        diag["selected_mode"] = "no_words"
+        return None, diag
 
     heights = [float(w.get("height", 0.0)) for w in page_words if float(w.get("height", 0.0)) > 0]
     y_tol = 3.0 if not heights else max(2.0, min(4.5, (sum(heights) / len(heights)) * 0.6))
 
     rows = _cluster_words_by_y(page_words, y_tol=y_tol)
+    diag["rows_scanned"] = len(rows)
     scored_rows: List[Tuple[int, List[Dict[str, Any]], Set[str]]] = []
 
     for rw in rows:
@@ -946,10 +979,14 @@ def _find_table_header_band(page_words: List[Dict[str, Any]], *, allow_fallback:
                 keys.add(k)
         score = sum(k in keys for k in ("pos", "code", "rev", "desc", "qty"))
         scored_rows.append((score, rw, keys))
+        if score > int(diag["best_score"]):
+            diag["best_score"] = int(score)
+            diag["best_keys"] = sorted(keys)
         if ("pos" in keys and "code" in keys and score >= 3):
             y0 = min(float(w["top"]) for w in rw) - 3.0
             y1 = max(float(w["bottom"]) for w in rw) + 18.0
-            return (y0, y1)
+            diag["selected_mode"] = "strict"
+            return (y0, y1), diag
 
     if allow_fallback and _PDF_POLICY.header_fallback_strength > 0:
         for score, rw, keys in sorted(scored_rows, key=lambda t: t[0], reverse=True):
@@ -958,9 +995,11 @@ def _find_table_header_band(page_words: List[Dict[str, Any]], *, allow_fallback:
             if ("pos" in keys and ("code" in keys or "qty" in keys)):
                 y0 = min(float(w["top"]) for w in rw) - 2.0
                 y1 = max(float(w["bottom"]) for w in rw) + (12.0 + (3.0 * _PDF_POLICY.header_fallback_strength))
-                return (y0, y1)
+                diag["selected_mode"] = "fallback"
+                return (y0, y1), diag
 
-    return None
+    diag["selected_mode"] = "not_found"
+    return None, diag
 
 
 def _build_x_columns_from_header(header_words: List[Dict[str, Any]], page_width: float) -> List[Tuple[str, float, float]]:
@@ -1021,8 +1060,8 @@ def _assign_row_words_to_cols(row_words: List[Dict[str, Any]], cols: List[Tuple[
 # ============================================================
 # NEW: Grid-layout fallback (vertical lines + word-to-column)
 # ============================================================
-_GRID_TABLE_Y_MIN = 170.0
-_GRID_TABLE_Y_MAX = 800.0
+_GRID_TABLE_Y_MIN = _PDF_POLICY.grid_table_y_min
+_GRID_TABLE_Y_MAX = _PDF_POLICY.grid_table_y_max
 _GRID_MIN_VERTICAL_LINES = 8
 _GRID_X_CLUSTER_TOL = 2.0
 _GRID_Y_TOL = 3.0
@@ -1117,6 +1156,7 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
 
         if len(vlines) < _PDF_POLICY.min_vertical_lines_soft:
             pd.page_skipped_reason = f"low_vertical_lines:{len(vlines)}"
+            pd.page_skipped_details = f"min_soft={_PDF_POLICY.min_vertical_lines_soft} min_hard={_PDF_POLICY.min_vertical_lines}"
             warnings.append(f"[grid] page {page_idx+1}: saltata (linee verticali insufficienti: {len(vlines)}).")
             page_diags.append(pd.__dict__)
             continue
@@ -1130,6 +1170,7 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
         total_words += len(words)
         if not words:
             pd.page_skipped_reason = "no_words_in_table_band"
+            pd.page_skipped_details = f"band=[{_GRID_TABLE_Y_MIN},{_GRID_TABLE_Y_MAX}]"
             warnings.append(f"[grid] page {page_idx+1}: nessuna word nella banda tabella.")
             page_diags.append(pd.__dict__)
             continue
@@ -1151,10 +1192,18 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
             usable_words.append(w)
         total_words_used += len(usable_words)
 
-        hb = _find_table_header_band(usable_words, allow_fallback=True)
+        hb, hb_diag = _find_table_header_band(usable_words, allow_fallback=True)
+        pd.header_candidate_rows = int(hb_diag.get("rows_scanned", 0) or 0)
         if not hb:
             pd.page_skipped_reason = "missing_header"
-            warnings.append(f"[grid] page {page_idx+1}: header tabella non trovato.")
+            pd.page_skipped_details = (
+                f"best_score={hb_diag.get('best_score', 0)} keys={hb_diag.get('best_keys', [])} "
+                f"mode={hb_diag.get('selected_mode', 'none')}"
+            )
+            warnings.append(
+                f"[grid] page {page_idx+1}: header tabella non trovato "
+                f"({pd.page_skipped_details})."
+            )
             page_diags.append(pd.__dict__)
             continue
         pd.found_header = True
@@ -1165,7 +1214,8 @@ def _extract_lines_from_grid_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str,
         pd.detected_columns_count = len(col_map)
         if not _validate_minimum_colmap(col_map):
             pd.page_skipped_reason = "col_map_insufficient"
-            warnings.append(f"[grid] page {page_idx+1}: col_map insufficiente={col_map}")
+            pd.page_skipped_details = f"col_map={col_map} vlines={len(vlines)}"
+            warnings.append(f"[grid] page {page_idx+1}: col_map insufficiente ({pd.page_skipped_details})")
             page_diags.append(pd.__dict__)
             continue
 
@@ -1318,7 +1368,7 @@ def _extract_lines_from_layout(pdf: pdfplumber.PDF) -> Tuple[List[Dict[str, Any]
         if not words:
             continue
 
-        hb = _find_table_header_band(words)
+        hb, _ = _find_table_header_band(words)
         if not hb:
             continue
 
@@ -1478,6 +1528,8 @@ def parse_bom_pdf_raw(path: Path) -> dict:
             base_score = _compute_parser_quality(lines, warnings)
             grid_pages_skipped = sum(1 for p in page_diags if p.get("page_skipped_reason"))
             grid_score = _compute_parser_quality(grid_lines, grid_warn, pages_skipped=grid_pages_skipped)
+            score_gain = grid_score - base_score
+            output_delta = _compare_parser_outputs(lines, grid_lines)
 
             prefer_grid = False
             reason = "tables_preferred"
@@ -1485,8 +1537,15 @@ def parse_bom_pdf_raw(path: Path) -> dict:
                 prefer_grid = True
                 reason = "grid_has_rows_tables_empty"
             elif grid_lines and lines:
-                prefer_grid = grid_score >= base_score
-                reason = "quality_score_compare"
+                strong_gain = score_gain >= _PDF_POLICY.parser_min_score_gain_to_replace
+                weak_overlap = float(output_delta.get("code_overlap_ratio", 0.0) or 0.0) < 0.35
+                prefer_grid = bool(strong_gain or (grid_score >= base_score and not weak_overlap))
+                if strong_gain:
+                    reason = "quality_score_strong_gain"
+                elif weak_overlap:
+                    reason = "tables_preferred_low_code_overlap"
+                else:
+                    reason = "quality_score_compare"
 
             parser_compare = {
                 "tables": {
@@ -1500,14 +1559,26 @@ def parse_bom_pdf_raw(path: Path) -> dict:
                     "tail_fields": _count_complete_tail_fields(grid_lines),
                     "pages_skipped": grid_pages_skipped,
                 },
+                "score_gain": score_gain,
+                "min_gain_to_replace": _PDF_POLICY.parser_min_score_gain_to_replace,
+                "output_delta": output_delta,
                 "selected_reason": reason,
             }
 
             if prefer_grid:
-                warnings.append("Fallback grid-layout attivato (selezione guidata da quality score).")
+                warnings.append(
+                    "Fallback grid-layout attivato "
+                    f"(reason={reason}; gain={score_gain:.2f}; overlap={output_delta.get('code_overlap_ratio', 0.0):.2f})."
+                )
                 warnings.extend(grid_warn)
                 lines = grid_lines
                 parser_used = "grid-layout"
+            elif grid_lines and lines:
+                warnings.append(
+                    "Fallback grid-layout NON selezionato "
+                    f"(reason={reason}; gain={score_gain:.2f}; overlap={output_delta.get('code_overlap_ratio', 0.0):.2f})."
+                )
+                warnings.extend(grid_warn)
             elif not lines:
                 warnings.extend(grid_warn)
                 layout_lines, layout_warn = _extract_lines_from_layout(pdf)
@@ -1566,6 +1637,10 @@ def parse_bom_pdf_raw(path: Path) -> dict:
     for sr in suspicious_rows:
         sr["pdf_name"] = path.name
 
+    suspicious_footer_rows = sum(1 for r in suspicious_rows if "footer_contamination" in (r.get("suspicion_flags") or []))
+    suspicious_signature_rows = sum(1 for r in suspicious_rows if "signature_contamination" in (r.get("suspicion_flags") or []))
+    suspicious_page_marker_rows = sum(1 for r in suspicious_rows if "page_marker_contamination" in (r.get("suspicion_flags") or []))
+
     summary = {
         "pdf_name": path.name,
         "parser_selected": parser_used,
@@ -1585,6 +1660,9 @@ def parse_bom_pdf_raw(path: Path) -> dict:
         "discarded_footer_like_tokens": suspicious_footer_tokens_count,
         "rows_extracted": len(lines),
         "rows_flagged_suspicious": len(suspicious_rows),
+        "rows_flagged_footer_contamination": suspicious_footer_rows,
+        "rows_flagged_signature_contamination": suspicious_signature_rows,
+        "rows_flagged_page_marker_contamination": suspicious_page_marker_rows,
         "parser_quality_score": parser_quality_score,
         "grid_quality_score": (parser_compare.get("grid") or {}).get("quality_score") if parser_compare else None,
         "tables_quality_score": (parser_compare.get("tables") or {}).get("quality_score") if parser_compare else None,
